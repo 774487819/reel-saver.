@@ -1,0 +1,1306 @@
+name: Build Auto Reel Saver APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build_apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Create Flutter Project & Install Packages
+        run: |
+          flutter create -a kotlin --org com.autosaver --project-name my_saver_app app_build
+          cd app_build
+          flutter pub add dio shared_preferences path_provider video_player
+
+      - name: Configure Android XML & Manifest
+        run: |
+          mkdir -p app_build/android/app/src/main/res/xml
+          mkdir -p app_build/android/app/src/main/res/values
+
+          cat << 'EOF' > app_build/android/app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">محمّل الريلز الذكي</string>
+              <string name="acc_desc">محرك النقر الخلفي لنسخ وتحميل فيديوهات الريلز والتيك توك تلقائياً بدون علامة مائية</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app_build/android/app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagReportViewIds|flagRetrieveInteractiveWindows"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/acc_desc"
+              android:notificationTimeout="100" />
+          EOF
+
+          cat << 'EOF' > app_build/android/app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS"/>
+
+              <application
+                  android:label="@string/app_name"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleInstance"
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <meta-data
+                        android:name="io.flutter.embedding.android.NormalTheme"
+                        android:resource="@style/NormalTheme" />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AutoReelGrabberService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+
+                  <meta-data
+                      android:name="flutterEmbedding"
+                      android:value="2" />
+              </application>
+          </manifest>
+          EOF
+
+      - name: Write Native Kotlin Engine (MainActivity.kt)
+        run: |
+          mkdir -p app_build/android/app/src/main/kotlin/com/autosaver/my_saver_app
+          cat << 'EOF' > app_build/android/app/src/main/kotlin/com/autosaver/my_saver_app/MainActivity.kt
+          package com.autosaver.my_saver_app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.ClipboardManager
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Path
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.media.MediaScannerConnection
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import kotlin.math.abs
+
+          class MainActivity : FlutterActivity() {
+              private val CHANNEL = "auto_saver/channel"
+              private var methodChannel: MethodChannel? = null
+              private var waitingForClipboardFocus = false
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+
+                  methodChannel?.setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "openAccessibilitySettings" -> {
+                              val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                              intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                              startActivity(intent)
+                              result.success(true)
+                          }
+                          "requestOverlayPermission" -> {
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                                  val intent = Intent(
+                                      Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                      Uri.parse("package:$packageName")
+                                  )
+                                  startActivity(intent)
+                              }
+                              result.success(true)
+                          }
+                          "checkPermissions" -> {
+                              val acc = isServiceEnabled()
+                              val overlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                  Settings.canDrawOverlays(this)
+                              } else true
+                              result.success(mapOf("accessibility" to acc, "overlay" to overlay))
+                          }
+                          "updateSensitivity" -> {
+                              val value = call.argument<Double>("value") ?: 11.5
+                              getSharedPreferences("auto_saver_prefs", Context.MODE_PRIVATE)
+                                  .edit()
+                                  .putFloat("sensitivity", value.toFloat())
+                                  .apply()
+                              result.success(true)
+                          }
+                          "saveToGallery" -> {
+                              val path = call.argument<String>("path") ?: ""
+                              val saved = saveVideoToGallery(path)
+                              result.success(saved)
+                          }
+                          "vibrate" -> {
+                              val ms = call.argument<Int>("ms") ?: 200
+                              vibrateDevice(ms.toLong())
+                              result.success(true)
+                          }
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  if (intent.getBooleanExtra("auto_copied", false)) {
+                      waitingForClipboardFocus = true
+                  }
+              }
+
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus && (waitingForClipboardFocus || intent?.getBooleanExtra("auto_copied", false) == true)) {
+                      waitingForClipboardFocus = false
+                      intent?.removeExtra("auto_copied")
+
+                      Handler(Looper.getMainLooper()).postDelayed({
+                          val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          val clipText = clipboard.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+
+                          // إخفاء التطبيق فوراً للبقاء داخل تيك توك أو انستغرام
+                          moveTaskToBack(true)
+
+                          if (clipText.isNotEmpty()) {
+                              methodChannel?.invokeMethod("onAutoLinkCaptured", clipText)
+                          }
+                      }, 120)
+                  }
+              }
+
+              private fun saveVideoToGallery(filePath: String): Boolean {
+                  return try {
+                      val srcFile = File(filePath)
+                      if (!srcFile.exists()) return false
+                      val fileName = "Reel_${System.currentTimeMillis()}.mp4"
+
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          val values = ContentValues().apply {
+                              put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                              put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                              put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/AutoReelSaver")
+                              put(MediaStore.Video.Media.IS_PENDING, 1)
+                          }
+                          val resolver = applicationContext.contentResolver
+                          val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+                          resolver.openOutputStream(uri)?.use { outStream ->
+                              FileInputStream(srcFile).use { inStream ->
+                                  inStream.copyTo(outStream)
+                              }
+                          }
+                          values.clear()
+                          values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                          resolver.update(uri, values, null, null)
+                          true
+                      } else {
+                          val moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+                          val appDir = File(moviesDir, "AutoReelSaver")
+                          if (!appDir.exists()) appDir.mkdirs()
+                          val destFile = File(appDir, fileName)
+                          FileInputStream(srcFile).use { inStream ->
+                              FileOutputStream(destFile).use { outStream ->
+                                  inStream.copyTo(outStream)
+                              }
+                          }
+                          MediaScannerConnection.scanFile(this, arrayOf(destFile.absolutePath), arrayOf("video/mp4"), null)
+                          true
+                      }
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private fun vibrateDevice(durationMs: Long) {
+                  val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      vibrator.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
+                  } else {
+                      @Suppress("DEPRECATION")
+                      vibrator.vibrate(durationMs)
+                  }
+              }
+
+              private fun isServiceEnabled(): Boolean {
+                  val expected = "$packageName/${AutoReelGrabberService::class.java.canonicalName}"
+                  val enabledServices = Settings.Secure.getString(
+                      contentResolver,
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return enabledServices.contains(expected)
+              }
+          }
+
+          class AutoReelGrabberService : AccessibilityService(), SensorEventListener {
+              private var sensorManager: SensorManager? = null
+              private var firstTapTime: Long = 0
+              private var lastActionTime: Long = 0
+              private val handler = Handler(Looper.getMainLooper())
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+                  val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+                  sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+              }
+
+              override fun onSensorChanged(event: SensorEvent?) {
+                  if (event == null) return
+                  val prefs = getSharedPreferences("auto_saver_prefs", Context.MODE_PRIVATE)
+                  val sensitivity = prefs.getFloat("sensitivity", 11.5f)
+
+                  val x = abs(event.values[0])
+                  val y = abs(event.values[1])
+                  val z = abs(event.values[2])
+
+                  if (z > sensitivity && x < 6.0f && y < 6.0f) {
+                      val now = System.currentTimeMillis()
+                      if (now - lastActionTime < 5000) return
+
+                      if (now - firstTapTime > 500) {
+                          firstTapTime = now
+                      } else {
+                          val diff = now - firstTapTime
+                          if (diff in 120..500) {
+                              firstTapTime = 0
+                              lastActionTime = now
+                              executeAutoShareAndCopy()
+                          }
+                      }
+                  }
+              }
+
+              private fun executeAutoShareAndCopy() {
+                  vibrateShort(120)
+
+                  val root = rootInActiveWindow ?: return
+                  val shareWords = listOf("مشاركة", "إرسال", "Share", "Send", "share")
+                  val clickedShare = findAndClickNode(root, shareWords)
+
+                  if (!clickedShare) {
+                      tapCoordinates(0.91f, 0.72f)
+                  }
+
+                  handler.postDelayed({
+                      val currentRoot = rootInActiveWindow
+                      val copyWords = listOf("نسخ الرابط", "نسخ", "Copy link", "Copy URL", "copy")
+                      if (currentRoot != null) {
+                          findAndClickNode(currentRoot, copyWords)
+                      }
+
+                      handler.postDelayed({
+                          val launchIntent = Intent(this, MainActivity::class.java).apply {
+                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                              putExtra("auto_copied", true)
+                          }
+                          startActivity(launchIntent)
+                      }, 450)
+                  }, 850)
+              }
+
+              private fun findAndClickNode(node: AccessibilityNodeInfo, keywords: List<String>): Boolean {
+                  val text = node.text?.toString() ?: ""
+                  val desc = node.contentDescription?.toString() ?: ""
+                  val viewId = node.viewIdResourceName ?: ""
+
+                  for (word in keywords) {
+                      if (text.contains(word, ignoreCase = true) ||
+                          desc.contains(word, ignoreCase = true) ||
+                          viewId.contains(word, ignoreCase = true)
+                      ) {
+                          if (clickClickableParent(node)) return true
+                      }
+                  }
+
+                  for (i in 0 until node.childCount) {
+                      val child = node.getChild(i) ?: continue
+                      if (findAndClickNode(child, keywords)) return true
+                  }
+                  return false
+              }
+
+              private fun clickClickableParent(node: AccessibilityNodeInfo?): Boolean {
+                  var current = node
+                  while (current != null) {
+                      if (current.isClickable) {
+                          return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                      }
+                      current = current.parent
+                  }
+                  return false
+              }
+
+              private fun tapCoordinates(xRatio: Float, yRatio: Float) {
+                  val metrics = resources.displayMetrics
+                  val path = Path().apply {
+                      moveTo(metrics.widthPixels * xRatio, metrics.heightPixels * yRatio)
+                  }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 80))
+                      .build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              private fun vibrateShort(ms: Long) {
+                  val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      vibrator.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                  } else {
+                      @Suppress("DEPRECATION")
+                      vibrator.vibrate(ms)
+                  }
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+          }
+          EOF
+
+      - name: Write Flutter Sleek UI & Video Library (lib/main.dart)
+        run: |
+          cat << 'EOF' > app_build/lib/main.dart
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:dio/dio.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:video_player/video_player.dart';
+
+          // ==========================================================
+          // ضع اسمك الشخصي هنا ليظهر في التصميم الرئيسي للتطبيق
+          // ==========================================================
+          const String kDeveloperName = "تطوير: [اكتب اسمك هنا]";
+          const String kAppTitle = "محمّل الريلز والتيك توك الذكي";
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const AutoReelSaverApp());
+          }
+
+          class DownloadedVideoItem {
+            final String id;
+            final String title;
+            final String platform;
+            final String filePath;
+            final String date;
+            final String sizeMb;
+
+            DownloadedVideoItem({
+              required this.id,
+              required this.title,
+              required this.platform,
+              required this.filePath,
+              required this.date,
+              required this.sizeMb,
+            });
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'title': title,
+                  'platform': platform,
+                  'filePath': filePath,
+                  'date': date,
+                  'sizeMb': sizeMb,
+                };
+
+            factory DownloadedVideoItem.fromJson(Map<String, dynamic> json) =>
+                DownloadedVideoItem(
+                  id: json['id'] ?? '',
+                  title: json['title'] ?? 'فيديو محمّل',
+                  platform: json['platform'] ?? 'TikTok',
+                  filePath: json['filePath'] ?? '',
+                  date: json['date'] ?? '',
+                  sizeMb: json['sizeMb'] ?? '0 MB',
+                );
+          }
+
+          class AutoReelSaverApp extends StatelessWidget {
+            const AutoReelSaverApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: kAppTitle,
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData.dark().copyWith(
+                  scaffoldBackgroundColor: const Color(0xFF090D16),
+                  colorScheme: const ColorScheme.dark(
+                    primary: Color(0xFF00F2FE),
+                    secondary: Color(0xFF4FACFE),
+                  ),
+                ),
+                home: const MainDashboard(),
+              );
+            }
+          }
+
+          class MainDashboard extends StatefulWidget {
+            const MainDashboard({super.key});
+
+            @override
+            State<MainDashboard> createState() => _MainDashboardState();
+          }
+
+          class _MainDashboardState extends State<MainDashboard>
+              with WidgetsBindingObserver {
+            static const MethodChannel _channel = MethodChannel('auto_saver/channel');
+            final Dio _dio = Dio();
+            final TextEditingController _manualUrlController = TextEditingController();
+
+            int _selectedTabIndex = 0;
+            bool _isAccEnabled = false;
+            bool _isOverlayEnabled = false;
+            bool _isDownloading = false;
+            double _progress = 0.0;
+            double _sensitivity = 11.5;
+            String _statusText = "تصفح تيك توك أو ريلز وانقر مرتين خلف الهاتف للنسخ والتحميل التلقائي";
+            List<DownloadedVideoItem> _downloadedVideos = [];
+
+            @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addObserver(this);
+              _loadInitialData();
+
+              _channel.setMethodCallHandler((call) async {
+                if (call.method == "onAutoLinkCaptured") {
+                  final String copiedUrl = call.arguments as String? ?? "";
+                  if (copiedUrl.isNotEmpty) {
+                    await _startVideoDownload(copiedUrl);
+                  }
+                }
+              });
+            }
+
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              _manualUrlController.dispose();
+              super.dispose();
+            }
+
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              if (state == AppLifecycleState.resumed) {
+                _checkPermissions();
+              }
+            }
+
+            Future<void> _loadInitialData() async {
+              await _checkPermissions();
+              final prefs = await SharedPreferences.getInstance();
+              final savedList = prefs.getStringList('saved_videos_list') ?? [];
+              final List<DownloadedVideoItem> loaded = [];
+
+              for (final itemStr in savedList) {
+                try {
+                  final item = DownloadedVideoItem.fromJson(jsonDecode(itemStr));
+                  if (File(item.filePath).existsSync()) {
+                    loaded.add(item);
+                  }
+                } catch (_) {}
+              }
+
+              setState(() {
+                _sensitivity = prefs.getDouble('tap_sensitivity') ?? 11.5;
+                _downloadedVideos = loaded;
+              });
+            }
+
+            Future<void> _checkPermissions() async {
+              try {
+                final res = await _channel.invokeMethod<Map>('checkPermissions');
+                if (res != null) {
+                  setState(() {
+                    _isAccEnabled = res['accessibility'] == true;
+                    _isOverlayEnabled = res['overlay'] == true;
+                  });
+                }
+              } catch (_) {}
+            }
+
+            Future<void> _saveVideoListToStorage() async {
+              final prefs = await SharedPreferences.getInstance();
+              final encoded = _downloadedVideos
+                  .map((v) => jsonEncode(v.toJson()))
+                  .toList();
+              await prefs.setStringList('saved_videos_list', encoded);
+            }
+
+            Future<void> _startVideoDownload(String rawUrl) async {
+              if (_isDownloading) return;
+
+              final urlMatch = RegExp(r'https?://\S+').firstMatch(rawUrl);
+              final cleanUrl = urlMatch?.group(0) ?? rawUrl.trim();
+
+              if (!cleanUrl.contains("tiktok.com") &&
+                  !cleanUrl.contains("instagram.com")) {
+                setState(() {
+                  _statusText = "الرابط الملتقط ليس فيديو تيك توك أو ريلز صالح!";
+                });
+                return;
+              }
+
+              setState(() {
+                _isDownloading = true;
+                _progress = 0.0;
+                _statusText = "جاري فك التشفير وإزالة العلامة المائية...";
+              });
+
+              try {
+                String? directUrl;
+                String videoTitle = "فيديو بدون علامة مائية";
+                final String platform =
+                    cleanUrl.contains("tiktok.com") ? "TikTok" : "Instagram Reels";
+
+                if (platform == "TikTok") {
+                  final res = await _dio.post(
+                    'https://www.tikwm.com/api/',
+                    data: {'url': cleanUrl, 'hd': 1},
+                    options: Options(contentType: Headers.formUrlEncodedContentType),
+                  );
+                  if (res.statusCode == 200 && res.data['code'] == 0) {
+                    directUrl =
+                        res.data['data']['hdplay'] ?? res.data['data']['play'];
+                    final rawTitle = res.data['data']['title']?.toString() ?? "";
+                    if (rawTitle.trim().isNotEmpty) {
+                      videoTitle = rawTitle.trim();
+                    }
+                  }
+                } else {
+                  final res = await _dio.post(
+                    'https://api.cobalt.tools/api/json',
+                    data: {'url': cleanUrl},
+                    options: Options(headers: {
+                      'Accept': 'application/json',
+                      'Content-Type': 'application/json',
+                    }),
+                  );
+                  if (res.statusCode == 200) {
+                    directUrl = res.data['url'];
+                    videoTitle = "فيديو ريلز انستغرام";
+                  }
+                }
+
+                if (directUrl == null || directUrl.isEmpty) {
+                  throw Exception("تعذر استخراج الرابط المباشر");
+                }
+
+                setState(() => _statusText = "جاري تنزيل الفيديو بأعلى جودة...");
+
+                final appDir = await getApplicationDocumentsDirectory();
+                final videosDir = Directory('${appDir.path}/downloaded_reels');
+                if (!await videosDir.exists()) {
+                  await videosDir.create(recursive: true);
+                }
+
+                final id = DateTime.now().millisecondsSinceEpoch.toString();
+                final localFilePath = '${videosDir.path}/vid_$id.mp4';
+
+                await _dio.download(
+                  directUrl,
+                  localFilePath,
+                  onReceiveProgress: (rec, total) {
+                    if (total != -1) {
+                      setState(() => _progress = rec / total);
+                    }
+                  },
+                );
+
+                // حفظ نسخة في معرض الهاتف العام (Gallery)
+                await _channel.invokeMethod('saveToGallery', {'path': localFilePath});
+
+                // حساب حجم الملف وإضافته إلى مكتبة التطبيق الداخلية
+                final fileBytes = await File(localFilePath).length();
+                final sizeMb = "${(fileBytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+                final now = DateTime.now();
+                final dateStr =
+                    "${now.year}/${now.month.toString().padLeft(2, '0')}/${now.day.toString().padLeft(2, '0')} - ${now.hour}:${now.minute.toString().padLeft(2, '0')}";
+
+                final newItem = DownloadedVideoItem(
+                  id: id,
+                  title: videoTitle,
+                  platform: platform,
+                  filePath: localFilePath,
+                  date: dateStr,
+                  sizeMb: sizeMb,
+                );
+
+                setState(() {
+                  _downloadedVideos.insert(0, newItem);
+                  _statusText = "تم التحميل والحفظ في التطبيق والمعرض بنجاح!";
+                  _manualUrlController.clear();
+                });
+
+                await _saveVideoListToStorage();
+                await _channel.invokeMethod('vibrate', {'ms': 300});
+              } catch (e) {
+                setState(() {
+                  _statusText = "فشل التحميل: تأكد أن الحساب عام وأعد المحاولة.";
+                });
+              } finally {
+                setState(() => _isDownloading = false);
+              }
+            }
+
+            Future<void> _deleteVideo(DownloadedVideoItem item) async {
+              try {
+                final f = File(item.filePath);
+                if (await f.exists()) {
+                  await f.delete();
+                }
+              } catch (_) {}
+
+              setState(() {
+                _downloadedVideos.removeWhere((v) => v.id == item.id);
+              });
+              await _saveVideoListToStorage();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Directionality(
+                textDirection: TextDirection.rtl,
+                child: Scaffold(
+                  appBar: AppBar(
+                    backgroundColor: const Color(0xFF111827),
+                    elevation: 0,
+                    centerTitle: true,
+                    title: const Text(
+                      kAppTitle,
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                    ),
+                  ),
+                  body: _selectedTabIndex == 0
+                      ? _buildHomeRadarTab()
+                      : _buildDownloadedLibraryTab(),
+                  bottomNavigationBar: NavigationBar(
+                    backgroundColor: const Color(0xFF111827),
+                    selectedIndex: _selectedTabIndex,
+                    onDestinationSelected: (idx) =>
+                        setState(() => _selectedTabIndex = idx),
+                    destinations: [
+                      const NavigationDestination(
+                        icon: Icon(Icons.radar_outlined),
+                        selectedIcon: Icon(Icons.radar, color: Color(0xFF00F2FE)),
+                        label: 'الرادار والتحميل',
+                      ),
+                      NavigationDestination(
+                        icon: Badge(
+                          isLabelVisible: _downloadedVideos.isNotEmpty,
+                          label: Text('${_downloadedVideos.length}'),
+                          child: const Icon(Icons.video_library_outlined),
+                        ),
+                        selectedIcon: const Icon(
+                          Icons.video_library,
+                          color: Color(0xFF00F2FE),
+                        ),
+                        label: 'الفيديوهات المحمّلة',
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            Widget _buildHomeRadarTab() {
+              final bool allReady = _isAccEnabled && _isOverlayEnabled;
+
+              return SingleChildScrollView(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // البطاقة الملكية باسمك الشخصي
+                    Container(
+                      padding: const EdgeInsets.all(22),
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFF0284C7), Color(0xFF4F46E5), Color(0xFF7C3AED)],
+                          begin: Alignment.topRight,
+                          end: Alignment.bottomLeft,
+                        ),
+                        borderRadius: BorderRadius.circular(22),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFF4F46E5).withOpacity(0.35),
+                            blurRadius: 18,
+                            offset: const Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.15),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.touch_app_rounded,
+                              size: 42,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            kDeveloperName,
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          const Text(
+                            "انقر مرتين خلف الهاتف أثناء المشاهدة لنسخ الرابط وتحميل الفيديو تلقائياً بدون علامة مائية",
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: Colors.white70, fontSize: 13),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // بطاقة تفعيل الصلاحيات الذكية
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF161F33),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: allReady
+                              ? Colors.greenAccent.withOpacity(0.5)
+                              : Colors.amber.withOpacity(0.5),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                allReady ? Icons.verified_rounded : Icons.warning_amber_rounded,
+                                color: allReady ? Colors.greenAccent : Colors.amber,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  allReady
+                                      ? "المحرك التلقائي نشط وجاهز للعمل!"
+                                      : "خطوات التفعيل لأول مرة فقط:",
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 15,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          if (!allReady) ...[
+                            const SizedBox(height: 14),
+                            if (!_isOverlayEnabled)
+                              ElevatedButton.icon(
+                                onPressed: () =>
+                                    _channel.invokeMethod('requestOverlayPermission'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF38BDF8),
+                                  foregroundColor: Colors.black,
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                ),
+                                icon: const Icon(Icons.layers),
+                                label: const Text(
+                                  "1. السماح بالعمل التلقائي في الخلفية",
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                            const SizedBox(height: 8),
+                            if (!_isAccEnabled)
+                              ElevatedButton.icon(
+                                onPressed: () =>
+                                    _channel.invokeMethod('openAccessibilitySettings'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.amber,
+                                  foregroundColor: Colors.black,
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                ),
+                                icon: const Icon(Icons.accessibility_new),
+                                label: const Text(
+                                  "2. تفعيل خدمة النسخ التلقائي (Accessibility)",
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+
+                    // شريط حالة التحميل المباشر
+                    Container(
+                      padding: const EdgeInsets.all(18),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF161F33),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: Column(
+                        children: [
+                          if (_isDownloading) ...[
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(10),
+                              child: LinearProgressIndicator(
+                                value: _progress,
+                                minHeight: 10,
+                                backgroundColor: Colors.white12,
+                                color: const Color(0xFF00F2FE),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Text(
+                              "${(_progress * 100).toStringAsFixed(0)}%",
+                              style: const TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFF00F2FE),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                          ],
+                          Text(
+                            _statusText,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(fontSize: 14, color: Colors.white70),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+
+                    // معايرة حساسية النقر الخلفي
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF161F33),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text(
+                                "حساسية النقر خلف الهاتف:",
+                                style: TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                              Text(
+                                _sensitivity.toStringAsFixed(1),
+                                style: const TextStyle(
+                                  color: Color(0xFF00F2FE),
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          Slider(
+                            value: _sensitivity,
+                            min: 7.5,
+                            max: 16.0,
+                            divisions: 17,
+                            onChanged: (val) async {
+                              setState(() => _sensitivity = val);
+                              final prefs = await SharedPreferences.getInstance();
+                              await prefs.setDouble('tap_sensitivity', val);
+                              await _channel.invokeMethod(
+                                'updateSensitivity',
+                                {'value': val},
+                              );
+                            },
+                          ),
+                          const Text(
+                            "قيمة أقل = نقرة خفيفة | قيمة أعلى = نقرة أقوى",
+                            style: TextStyle(fontSize: 12, color: Colors.white54),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+
+                    // صندوق التحميل اليدوي الإضافي
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF161F33),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          const Text(
+                            "أو الصق رابط فيديو للتحميل المباشر:",
+                            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: _manualUrlController,
+                            decoration: InputDecoration(
+                              hintText: "https://www.tiktok.com/... أو instagram.com/...",
+                              filled: true,
+                              fillColor: const Color(0xFF090D16),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide: BorderSide.none,
+                              ),
+                              suffixIcon: IconButton(
+                                icon: const Icon(Icons.paste_rounded),
+                                onPressed: () async {
+                                  final data =
+                                      await Clipboard.getData(Clipboard.kTextPlain);
+                                  if (data?.text != null) {
+                                    _manualUrlController.text = data!.text!;
+                                  }
+                                },
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          ElevatedButton.icon(
+                            onPressed: _isDownloading
+                                ? null
+                                : () => _startVideoDownload(_manualUrlController.text),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF00F2FE),
+                              foregroundColor: Colors.black,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            icon: const Icon(Icons.download_rounded),
+                            label: const Text(
+                              "تحميل بدون علامة مائية",
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            // ==========================================================
+            // تبويب مكتبة الفيديوهات المحمّلة داخل التطبيق
+            // ==========================================================
+            Widget _buildDownloadedLibraryTab() {
+              if (_downloadedVideos.isEmpty) {
+                return const Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.video_collection_outlined,
+                        size: 72,
+                        color: Colors.white24,
+                      ),
+                      SizedBox(height: 14),
+                      Text(
+                        "لا توجد فيديوهات محمّلة بعد",
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white70,
+                        ),
+                      ),
+                      SizedBox(height: 6),
+                      Text(
+                        "أي فيديو تحمّله بالنقر الخلفي سيظهر هنا وفي معرض هاتفك",
+                        style: TextStyle(fontSize: 13, color: Colors.white38),
+                      ),
+                    ],
+                  ),
+                );
+              }
+
+              return ListView.builder(
+                padding: const EdgeInsets.all(16),
+                itemCount: _downloadedVideos.length,
+                itemBuilder: (context, index) {
+                  final video = _downloadedVideos[index];
+                  final isTikTok = video.platform == "TikTok";
+
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 14),
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF161F33),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: Colors.white10),
+                    ),
+                    child: Row(
+                      children: [
+                        // زر تشغيل الفيديو
+                        GestureDetector(
+                          onTap: () => _openVideoPlayerModal(video),
+                          child: Container(
+                            width: 68,
+                            height: 68,
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                colors: isTikTok
+                                    ? [const Color(0xFF00F2FE), const Color(0xFFFF0844)]
+                                    : [const Color(0xFFF58529), const Color(0xFFDD2A7B)],
+                              ),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: const Icon(
+                              Icons.play_arrow_rounded,
+                              size: 40,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 3,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: isTikTok
+                                          ? Colors.cyan.withOpacity(0.2)
+                                          : Colors.pinkAccent.withOpacity(0.2),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Text(
+                                      video.platform,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.bold,
+                                        color: isTikTok
+                                            ? Colors.cyanAccent
+                                            : Colors.pinkAccent,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    video.sizeMb,
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.white54,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                video.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                video.date,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white38,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(
+                            Icons.delete_outline_rounded,
+                            color: Colors.redAccent,
+                          ),
+                          onPressed: () => _deleteVideo(video),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              );
+            }
+
+            void _openVideoPlayerModal(DownloadedVideoItem item) {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => InAppVideoPlayerScreen(videoItem: item),
+                ),
+              );
+            }
+          }
+
+          // ==========================================================
+          // شاشة مشغل الفيديو الداخلي
+          // ==========================================================
+          class InAppVideoPlayerScreen extends StatefulWidget {
+            final DownloadedVideoItem videoItem;
+            const InAppVideoPlayerScreen({super.key, required this.videoItem});
+
+            @override
+            State<InAppVideoPlayerScreen> createState() =>
+                _InAppVideoPlayerScreenState();
+          }
+
+          class _InAppVideoPlayerScreenState extends State<InAppVideoPlayerScreen> {
+            late VideoPlayerController _controller;
+            bool _initialized = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = VideoPlayerController.file(File(widget.videoItem.filePath))
+                ..initialize().then((_) {
+                  setState(() => _initialized = true);
+                  _controller.setLooping(true);
+                  _controller.play();
+                });
+            }
+
+            @override
+            void dispose() {
+              _controller.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Directionality(
+                textDirection: TextDirection.rtl,
+                child: Scaffold(
+                  backgroundColor: Colors.black,
+                  appBar: AppBar(
+                    backgroundColor: Colors.black,
+                    title: Text(
+                      widget.videoItem.title,
+                      style: const TextStyle(fontSize: 15),
+                    ),
+                  ),
+                  body: Center(
+                    child: _initialized
+                        ? GestureDetector(
+                            onTap: () {
+                              setState(() {
+                                _controller.value.isPlaying
+                                    ? _controller.pause()
+                                    : _controller.play();
+                              });
+                            },
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                AspectRatio(
+                                  aspectRatio: _controller.value.aspectRatio,
+                                  child: VideoPlayer(_controller),
+                                ),
+                                if (!_controller.value.isPlaying)
+                                  Container(
+                                    padding: const EdgeInsets.all(16),
+                                    decoration: const BoxDecoration(
+                                      color: Colors.black54,
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: const Icon(
+                                      Icons.play_arrow_rounded,
+                                      size: 54,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          )
+                        : const CircularProgressIndicator(color: Color(0xFF00F2FE)),
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build Release APK
+        run: |
+          cd app_build
+          flutter build apk --release
+
+      - name: Upload Ready APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Auto-Reel-Saver-APK
+          path: app_build/build/app/outputs/flutter-apk/app-release.apk
