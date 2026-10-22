@@ -87,10 +87,11 @@ jobs:
                       </intent-filter>
                   </activity>
 
+                  <!-- FIX: accessibility service must NOT be exported -->
                   <service
                       android:name=".AutoReelGrabberService"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-                      android:exported="true">
+                      android:exported="false">
                       <intent-filter>
                           <action android:name="android.accessibilityservice.AccessibilityService" />
                       </intent-filter>
@@ -217,23 +218,26 @@ jobs:
 
               // التحقق البرمجي الصارم من أن الملف فيديو MP4 حقيقي يحتوي على صورة وصوت وليس جزءاً تالفاً 0.1 MB
               private fun isPlayableVideoFile(filePath: String): Boolean {
+                  var retriever: MediaMetadataRetriever? = null
                   return try {
                       val file = File(filePath)
                       if (!file.exists() || file.length() < 150 * 1024) {
                           return false
                       }
-                      val retriever = MediaMetadataRetriever()
+                      retriever = MediaMetadataRetriever()
                       retriever.setDataSource(filePath)
                       val hasVideo = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO)
                       val widthStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
                       val durationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                      retriever.release()
 
                       val width = widthStr?.toIntOrNull() ?: 0
                       val duration = durationStr?.toLongOrNull() ?: 0L
                       (hasVideo == "yes" && width > 0 && duration > 400L)
                   } catch (e: Exception) {
                       false
+                  } finally {
+                      // FIX: release() can throw on some devices/APIs - never crash the validator
+                      try { retriever?.release() } catch (_: Exception) {}
                   }
               }
 
@@ -304,7 +308,6 @@ jobs:
                                                   return;
                                               }
 
-                                              // استعلام GraphQL مباشر من داخل جلسة المتصفح الأصلية
                                               var lsdMatch = document.documentElement.innerHTML.match(/"LSD"\s*,\s*\[\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/);
                                               var lsd = lsdMatch ? lsdMatch[1] : 'AVqbxe3J_YA';
                                               var docIds = ['8845758582119845', '10015901848480474', '7153636648076553'];
@@ -333,7 +336,6 @@ jobs:
                                                   } catch (e) {}
                                               }
 
-                                              // محاولة أخيرة عبر تشغيل عنصر الفيديو في الصفحة
                                               var btn = document.querySelector('.EmbedVideo, .WatchOnInstagram, button, div[role="button"]');
                                               if (btn) btn.click();
                                               for (var t = 0; t < 10; t++) {
@@ -551,6 +553,8 @@ jobs:
               }
 
               private fun tapCoordinates(xRatio: Float, yRatio: Float) {
+                  // FIX: dispatchGesture requires API 24+ (Android 7.0) - guard against crash on old devices
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
                   val metrics = resources.displayMetrics
                   val path = Path().apply {
                       moveTo(metrics.widthPixels * xRatio, metrics.heightPixels * yRatio)
@@ -667,6 +671,7 @@ jobs:
             static const MethodChannel _channel = MethodChannel('auto_saver/channel');
             late final Dio _dio;
             final TextEditingController _manualUrlController = TextEditingController();
+            final TextEditingController _customApiController = TextEditingController();
 
             int _selectedTabIndex = 0;
             bool _isAccEnabled = false;
@@ -710,6 +715,7 @@ jobs:
             void dispose() {
               WidgetsBinding.instance.removeObserver(this);
               _manualUrlController.dispose();
+              _customApiController.dispose();
               super.dispose();
             }
 
@@ -737,6 +743,7 @@ jobs:
 
               setState(() {
                 _sensitivity = prefs.getDouble('tap_sensitivity') ?? 11.5;
+                _customApiController.text = prefs.getString('custom_api_url') ?? '';
                 _downloadedVideos = loaded;
               });
             }
@@ -802,13 +809,14 @@ jobs:
                       : 'https://www.instagram.com$loc';
                   final code = _extractIgShortcodeFromText(fullLoc);
                   if (code != null) return code;
+                  // FIX: stop following if Instagram redirects to login page - no point continuing
+                  if (fullLoc.contains('/accounts/login')) break;
                   currentUrl = fullLoc;
                 }
               } catch (_) {}
               return null;
             }
 
-            // فك جميع علامات التنصيص والشرطات المائلة أولاً ثم استخراج روابط الفيديو الكاملة فقط
             List<String> _extractAllValidVideoUrls(String raw) {
               final List<String> results = [];
               final norm = raw
@@ -836,26 +844,22 @@ jobs:
                 }
               }
 
-              // 1. حقل video_url المباشر في إنستغرام
               for (final m in RegExp(r'"video_url"\s*:\s*"(https?://[^"]+)"')
                   .allMatches(norm)) {
                 addCandidate(m.group(1));
               }
 
-              // 2. مصفوفة video_versions
               for (final m in RegExp(
                       r'"video_versions"\s*:\s*\[\s*\{[^}]*"url"\s*:\s*"(https?://[^"]+)"')
                   .allMatches(norm)) {
                 addCandidate(m.group(1));
               }
 
-              // 3. وسم <video src="...">
               for (final m
                   in RegExp(r'<video[^>]+src="(https?://[^"]+)"').allMatches(norm)) {
                 addCandidate(m.group(1));
               }
 
-              // 4. روابط MP4 من الخوادم السحابية
               for (final m in RegExp(
                 r'"(?:url|hdplay|play|noWatermark|video)"\s*:\s*"(https?://[^"]+)"',
                 caseSensitive: false,
@@ -914,24 +918,75 @@ jobs:
               return null;
             }
 
-            // تجربة تحميل الرابط وفحصه برمجياً للتأكد أنه فيديو حقيقي وليس ملفاً تالفاً 0.1 MB
+            // FIX: new engine - user-configurable private server (yt-dlp based).
+            // This is the ONLY reliable long-term method. See server.py in repo.
+            Future<String?> _tryCustomServer(String targetUrl) async {
+              final base = _customApiController.text.trim();
+              if (base.isEmpty) return null;
+              try {
+                final sep = base.contains('?') ? '&' : '?';
+                final res = await _dio.get(
+                  '$base${sep}url=${Uri.encodeComponent(targetUrl)}',
+                );
+                if (res.data is String) {
+                  final t = (res.data as String).trim();
+                  if (t.startsWith('http')) return t;
+                }
+                dynamic data = res.data;
+                try {
+                  data = res.data is String ? jsonDecode(res.data) : res.data;
+                } catch (_) {}
+                String? candidate;
+                void dig(dynamic d) {
+                  if (candidate != null || d == null) return;
+                  if (d is Map) {
+                    for (final k in [
+                      'url', 'video', 'video_url', 'hdplay', 'play', 'download', 'link'
+                    ]) {
+                      final v = d[k];
+                      if (v is String &&
+                          v.startsWith('http') &&
+                          !v.contains('.jpg') &&
+                          !v.contains('.png')) {
+                        candidate = v;
+                        return;
+                      }
+                    }
+                    d.forEach((_, v) => dig(v));
+                  } else if (d is List) {
+                    for (final v in d) dig(v);
+                  }
+                }
+                dig(data);
+                return candidate;
+              } catch (_) {}
+              return null;
+            }
+
+            // تجربة تحميل الرابط وفحصه برمجياً - مع اسم المحرك لتشخيص سبب الفشل
             Future<bool> _tryDownloadAndVerifyVideo(
               String candidateUrl,
               String savePath,
               bool isTikTok,
+              String engineName,
             ) async {
               try {
                 final f = File(savePath);
                 if (await f.exists()) await f.delete();
+
+                setState(() => _statusText = "جاري التحميل عبر محرك: $engineName");
 
                 await _dio.download(
                   candidateUrl,
                   savePath,
                   options: Options(
                     headers: {
-                      'Referer': isTikTok
-                          ? 'https://www.tiktok.com/'
-                          : 'https://www.instagram.com/',
+                      // FIX: tikwm media URLs need tikwm referer, not tiktok referer
+                      'Referer': engineName.contains('tikwm')
+                          ? 'https://www.tikwm.com/'
+                          : (isTikTok
+                              ? 'https://www.tiktok.com/'
+                              : 'https://www.instagram.com/'),
                       'Accept': '*/*',
                     },
                   ),
@@ -950,19 +1005,31 @@ jobs:
 
                 if (!isValid) {
                   if (await f.exists()) await f.delete();
+                  // FIX: tell the user WHICH engine failed and why
+                  setState(() => _statusText =
+                      "فشل محرك $engineName (ملف غير صالح)، جارٍ تجربة المحرك التالي...");
                   return false;
                 }
                 return true;
-              } catch (_) {
+              } catch (e) {
                 final f = File(savePath);
                 if (await f.exists()) await f.delete();
+                setState(() => _statusText =
+                    "فشل محرك $engineName (${e.toString().split('\n').first})، جارٍ تجربة المحرك التالي...");
                 return false;
               }
             }
 
             Future<bool> _downloadTikTokVerified(
                 String url, String savePath) async {
-              // 1. TikWM
+              // FIX: try user's own server FIRST - it is the only reliable method
+              final custom = await _tryCustomServer(url);
+              if (custom != null &&
+                  await _tryDownloadAndVerifyVideo(custom, savePath, true, 'الخادم الخاص')) {
+                return true;
+              }
+
+              // 1. TikWM (note: api often dead - low success rate in 2026)
               try {
                 final res = await _dio.post(
                   'https://www.tikwm.com/api/',
@@ -978,7 +1045,7 @@ jobs:
                     String? u = d[key]?.toString();
                     if (u != null && u.isNotEmpty) {
                       if (u.startsWith('/')) u = 'https://www.tikwm.com$u';
-                      if (await _tryDownloadAndVerifyVideo(u, savePath, true)) {
+                      if (await _tryDownloadAndVerifyVideo(u, savePath, true, 'tikwm')) {
                         return true;
                       }
                     }
@@ -986,26 +1053,34 @@ jobs:
                 }
               } catch (_) {}
 
-              // 2. TiklyDown
-              try {
-                final res = await _dio.get(
-                  'https://api.tiklydown.eu.org/api/download',
-                  queryParameters: {'url': url},
-                );
-                final raw =
-                    res.data is String ? res.data : jsonEncode(res.data);
-                for (final u in _extractAllValidVideoUrls(raw)) {
-                  if (await _tryDownloadAndVerifyVideo(u, savePath, true)) {
-                    return true;
-                  }
-                }
-              } catch (_) {}
-
-              // 3. Publer
+              // 2. Publer
               final publerUrl = await _extractViaPubler(url);
               if (publerUrl != null &&
-                  await _tryDownloadAndVerifyVideo(publerUrl, savePath, true)) {
+                  await _tryDownloadAndVerifyVideo(publerUrl, savePath, true, 'publer')) {
                 return true;
+              }
+
+              // 3. Cloud fallback APIs - EDIT THIS LIST: free APIs die constantly
+              final encoded = Uri.encodeComponent(url);
+              final cloudApis = [
+                'https://api.tiklydown.eu.org/api/download?url=$encoded',
+                'https://api.siputzx.my.id/api/d/ttdl?url=$encoded',
+                'https://api.siputzx.my.id/api/d/fastdl?url=$encoded',
+              ];
+              for (final apiUrl in cloudApis) {
+                try {
+                  // FIX: read raw bytes instead of ResponseType.plain (safer across dio versions)
+                  final res = await _dio.get(
+                    apiUrl,
+                    options: Options(responseType: ResponseType.bytes),
+                  );
+                  final raw = utf8.decode(res.data, allowMalformed: true);
+                  for (final u in _extractAllValidVideoUrls(raw)) {
+                    if (await _tryDownloadAndVerifyVideo(u, savePath, true, 'api سحابي')) {
+                      return true;
+                    }
+                  }
+                } catch (_) {}
               }
 
               return false;
@@ -1018,7 +1093,14 @@ jobs:
                   ? 'https://www.instagram.com/reel/$shortcode/'
                   : rawUrl.split('?').first;
 
-              // المحرك 1: متصفح النظام الأصلي + استعلام GraphQL داخلي
+              // FIX: try user's own server FIRST
+              final custom = await _tryCustomServer(cleanUrl);
+              if (custom != null &&
+                  await _tryDownloadAndVerifyVideo(custom, savePath, false, 'الخادم الخاص')) {
+                return true;
+              }
+
+              // 1. WebView + internal GraphQL
               if (shortcode != null) {
                 setState(() => _statusText =
                     "جاري استخراج الفيديو الأصلي الكامل (HD MP4)...");
@@ -1028,12 +1110,12 @@ jobs:
                     {'shortcode': shortcode},
                   );
                   if (wvUrl != null &&
-                      await _tryDownloadAndVerifyVideo(wvUrl, savePath, false)) {
+                      await _tryDownloadAndVerifyVideo(wvUrl, savePath, false, 'محرك WebView')) {
                     return true;
                   }
                 } catch (_) {}
 
-                // المحرك 2: استخراج مباشر عبر GraphQL
+                // 2. Direct GraphQL
                 const lsdToken = 'AVqbxe3J_YA';
                 for (final docId in [
                   '8845758582119845',
@@ -1066,39 +1148,39 @@ jobs:
                     final raw =
                         res.data is String ? res.data : jsonEncode(res.data);
                     for (final u in _extractAllValidVideoUrls(raw)) {
-                      if (await _tryDownloadAndVerifyVideo(u, savePath, false)) {
+                      if (await _tryDownloadAndVerifyVideo(u, savePath, false, 'GraphQL')) {
                         return true;
                       }
                     }
                   } catch (_) {}
                 }
 
-                // المحرك 3: صفحة Embed بعد فك التشفير الصحيح
+                // 3. Embed page (read raw bytes - safer than ResponseType.plain)
                 try {
                   final res = await _dio.get(
                     'https://www.instagram.com/p/$shortcode/embed/captioned/',
-                    options: Options(responseType: ResponseType.plain),
+                    options: Options(responseType: ResponseType.bytes),
                   );
-                  for (final u
-                      in _extractAllValidVideoUrls(res.data.toString())) {
-                    if (await _tryDownloadAndVerifyVideo(u, savePath, false)) {
+                  final raw = utf8.decode(res.data, allowMalformed: true);
+                  for (final u in _extractAllValidVideoUrls(raw)) {
+                    if (await _tryDownloadAndVerifyVideo(u, savePath, false, 'Embed')) {
                       return true;
                     }
                   }
                 } catch (_) {}
               }
 
-              // المحرك 4: محرك Publer السحابي
+              // 4. Publer cloud engine
               setState(
                   () => _statusText = "جاري التحميل عبر الخادم السحابي...");
               final publerVideo = await _extractViaPubler(cleanUrl);
               if (publerVideo != null &&
                   await _tryDownloadAndVerifyVideo(
-                      publerVideo, savePath, false)) {
+                      publerVideo, savePath, false, 'publer')) {
                 return true;
               }
 
-              // المحرك 5: الخوادم السحابية الاحتياطية مع فحص سلامة الفيديو
+              // 5. Cloud backup APIs - EDIT THIS LIST: free APIs die constantly
               final encoded = Uri.encodeComponent(cleanUrl);
               final cloudApis = [
                 'https://api.siputzx.my.id/api/d/igdl?url=$encoded',
@@ -1110,11 +1192,13 @@ jobs:
 
               for (final apiUrl in cloudApis) {
                 try {
-                  final res = await _dio.get(apiUrl);
-                  final raw =
-                      res.data is String ? res.data : jsonEncode(res.data);
+                  final res = await _dio.get(
+                    apiUrl,
+                    options: Options(responseType: ResponseType.bytes),
+                  );
+                  final raw = utf8.decode(res.data, allowMalformed: true);
                   for (final u in _extractAllValidVideoUrls(raw)) {
-                    if (await _tryDownloadAndVerifyVideo(u, savePath, false)) {
+                    if (await _tryDownloadAndVerifyVideo(u, savePath, false, 'api سحابي')) {
                       return true;
                     }
                   }
@@ -1165,7 +1249,7 @@ jobs:
 
                 if (!success) {
                   throw Exception(
-                      "تعذر الحصول على ملف فيديو صالح، تأكد أن الحساب عام.");
+                      "تعذر الحصول على ملف فيديو صالح من جميع المحركات. السبب الأكثر شيوعاً: كل الـ APIs المجانية توقفت عن العمل - أضف رابط خادمك الخاص (yt-dlp) في الأسفل.");
                 }
 
                 await _channel
@@ -1557,6 +1641,60 @@ jobs:
                             label: const Text(
                               "تحميل بدون علامة مائية",
                               style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    // FIX: private server field - the only reliable extraction method
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF161F33),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: Colors.teal.withOpacity(0.4)),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          const Row(
+                            children: [
+                              Icon(Icons.dns_rounded, color: Color(0xFF00F2FE)),
+                              SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  "خادم الاستخراج الخاص (موصى به - يجعل التحميل يعمل دائماً):",
+                                  style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 13),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          const Text(
+                            "كل الـ APIs المجانية تموت خلال أسابيع. شغّل خادم yt-dlp مجاناً (Render/Hugging Face) والصق رابطه هنا. اتركه فارغاً لتجربة المحركات المجانية.",
+                            style:
+                                TextStyle(fontSize: 11, color: Colors.white54),
+                          ),
+                          const SizedBox(height: 10),
+                          TextField(
+                            controller: _customApiController,
+                            onChanged: (v) async {
+                              final prefs =
+                                  await SharedPreferences.getInstance();
+                              await prefs.setString('custom_api_url', v.trim());
+                            },
+                            decoration: InputDecoration(
+                              hintText:
+                                  "https://your-server.onrender.com/extract",
+                              filled: true,
+                              fillColor: const Color(0xFF090D16),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                                borderSide: BorderSide.none,
+                              ),
                             ),
                           ),
                         ],
