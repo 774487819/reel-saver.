@@ -106,7 +106,7 @@ jobs:
           </manifest>
           EOF
 
-      - name: Write Native Kotlin Engine (MainActivity.kt)
+      - name: Write Native Kotlin Engine + Headless WebView Extractor (MainActivity.kt)
         run: |
           mkdir -p app_build/android/app/src/main/kotlin/com/autosaver/my_saver_app
           cat << 'EOF' > app_build/android/app/src/main/kotlin/com/autosaver/my_saver_app/MainActivity.kt
@@ -114,6 +114,7 @@ jobs:
 
           import android.accessibilityservice.AccessibilityService
           import android.accessibilityservice.GestureDescription
+          import android.annotation.SuppressLint
           import android.content.ClipboardManager
           import android.content.ContentValues
           import android.content.Context
@@ -135,6 +136,11 @@ jobs:
           import android.provider.Settings
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
@@ -147,6 +153,7 @@ jobs:
               private val CHANNEL = "auto_saver/channel"
               private var methodChannel: MethodChannel? = null
               private var waitingForClipboardFocus = false
+              private var headlessWebView: WebView? = null
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
@@ -195,7 +202,115 @@ jobs:
                               vibrateDevice(ms.toLong())
                               result.success(true)
                           }
+                          "extractViaWebView" -> {
+                              val shortcode = call.argument<String>("shortcode") ?: ""
+                              extractInstagramViaWebView(shortcode, result)
+                          }
                           else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              // محرك WebView مخفي داخل النظام لاستخراج رابط MP4 الأصلي مباشرة من إنستغرام
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun extractInstagramViaWebView(shortcode: String, result: MethodChannel.Result) {
+                  if (shortcode.isEmpty()) {
+                      result.success(null)
+                      return
+                  }
+                  val mainHandler = Handler(Looper.getMainLooper())
+                  var isCompleted = false
+
+                  fun finishWith(url: String?) {
+                      if (!isCompleted) {
+                          isCompleted = true
+                          mainHandler.post {
+                              try {
+                                  headlessWebView?.stopLoading()
+                                  headlessWebView?.destroy()
+                                  headlessWebView = null
+                              } catch (_: Exception) {}
+                              result.success(url)
+                          }
+                      }
+                  }
+
+                  mainHandler.post {
+                      try {
+                          headlessWebView?.destroy()
+                          val wv = WebView(applicationContext)
+                          headlessWebView = wv
+                          wv.settings.javaScriptEnabled = true
+                          wv.settings.domStorageEnabled = true
+                          wv.settings.mediaPlaybackRequiresUserGesture = false
+                          wv.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                          wv.settings.userAgentString =
+                              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+                          wv.webViewClient = object : WebViewClient() {
+                              override fun shouldInterceptRequest(
+                                  view: WebView?,
+                                  request: WebResourceRequest?
+                              ): WebResourceResponse? {
+                                  val reqUrl = request?.url?.toString() ?: ""
+                                  if ((reqUrl.contains(".mp4") || reqUrl.contains("cdninstagram.com/v/") || reqUrl.contains("fbcdn.net/v/")) &&
+                                      !reqUrl.contains(".jpg") && !reqUrl.contains(".png") && !reqUrl.contains(".webp")
+                                  ) {
+                                      if (reqUrl.contains(".mp4") || reqUrl.contains("bytestart")) {
+                                          val cleanMp4 = reqUrl.replace(Regex("&bytestart=\\d+"), "")
+                                              .replace(Regex("&byteend=\\d+"), "")
+                                          finishWith(cleanMp4)
+                                      }
+                                  }
+                                  return super.shouldInterceptRequest(view, request)
+                              }
+
+                              override fun onPageFinished(view: WebView?, url: String?) {
+                                  super.onPageFinished(view, url)
+                                  val js = """
+                                      (function() {
+                                          var v = document.querySelector('video');
+                                          if (v && v.src && v.src.indexOf('http') === 0) return v.src;
+                                          var html = document.documentElement.innerHTML;
+                                          var m = html.match(/\\?"video_url\\?"\s*:\s*\\?"([^"\\]+)/);
+                                          if (m && m[1]) {
+                                              return m[1].replace(/\\\\\//g, '/').replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+                                          }
+                                          var playBtn = document.querySelector('.EmbedVideo, .WatchOnInstagram, button, div[role="button"]');
+                                          if (playBtn) playBtn.click();
+                                          return '';
+                                      })();
+                                  """.trimIndent()
+
+                                  view?.evaluateJavascript(js) { value ->
+                                      val cleaned = value?.trim()?.removeSurrounding("\"") ?: ""
+                                      if (cleaned.startsWith("http")) {
+                                          finishWith(cleaned)
+                                      } else {
+                                          mainHandler.postDelayed({
+                                              if (!isCompleted) {
+                                                  view.evaluateJavascript(
+                                                      "(function(){ var v = document.querySelector('video'); return v ? v.src : ''; })();"
+                                                  ) { v2 ->
+                                                      val c2 = v2?.trim()?.removeSurrounding("\"") ?: ""
+                                                      if (c2.startsWith("http")) {
+                                                          finishWith(c2)
+                                                      }
+                                                  }
+                                              }
+                                          }, 1800)
+                                      }
+                                  }
+                              }
+                          }
+
+                          wv.loadUrl("https://www.instagram.com/p/$shortcode/embed/captioned/")
+
+                          mainHandler.postDelayed({
+                              finishWith(null)
+                          }, 8500)
+                      } catch (e: Exception) {
+                          finishWith(null)
                       }
                   }
               }
@@ -415,7 +530,7 @@ jobs:
           }
           EOF
 
-      - name: Write Multi-Engine Flutter Extractor & UI (lib/main.dart)
+      - name: Write 12-Engine Flutter Extractor & UI (lib/main.dart)
         run: |
           cat << 'EOF' > app_build/lib/main.dart
           import 'dart:async';
@@ -521,11 +636,14 @@ jobs:
               super.initState();
               WidgetsBinding.instance.addObserver(this);
               _dio = Dio(BaseOptions(
-                connectTimeout: const Duration(seconds: 20),
-                receiveTimeout: const Duration(seconds: 40),
+                connectTimeout: const Duration(seconds: 15),
+                receiveTimeout: const Duration(seconds: 35),
+                validateStatus: (status) => status != null && status < 500,
                 headers: {
                   'User-Agent':
-                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                  'Accept': '*/*',
+                  'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
                 },
               ));
               _loadInitialData();
@@ -596,31 +714,111 @@ jobs:
             }
 
             // ==========================================================
-            // فك الروابط المختصرة مثل /share/reel/ و vt.tiktok.com
+            // استخراج كود الريلز وتنظيف الرابط من لواحق التتبع (?srtk= / ?igsh=)
+            // دون السماح لإنستغرام بتحويل الرابط إلى صفحة تسجيل الدخول
             // ==========================================================
-            Future<String> _resolveRedirectUrl(String url) async {
+            String? _extractIgShortcodeFromText(String input) {
+              final decoded = Uri.decodeFull(input);
+              final reg = RegExp(
+                r'instagram\.com/(?!share/)(?:[A-Za-z0-9_.-]+/)?(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)',
+                caseSensitive: false,
+              );
+              final match = reg.firstMatch(decoded);
+              if (match != null && match.group(1) != null) {
+                return match.group(1);
+              }
+              final fallback =
+                  RegExp(r'/(?:reel|reels|p|tv)/([A-Za-z0-9_-]{6,})')
+                      .firstMatch(decoded);
+              if (fallback != null && !decoded.contains('/share/')) {
+                return fallback.group(1);
+              }
+              return null;
+            }
+
+            Future<String?> _resolveShareLinkShortcode(String url) async {
+              // 1. إذا كان الكود موجوداً في الرابط مباشرة (مثل رابطك)، نستخرجه فوراً!
+              final directCode = _extractIgShortcodeFromText(url);
+              if (directCode != null) return directCode;
+
+              // 2. إذا كان رابط مشاركة (/share/reel/...)، نتتبع التحويل خطوة بخطوة قبل صفحة الدخول
               try {
-                final client = HttpClient();
-                client.userAgent =
-                    'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
-                final req = await client.getUrl(Uri.parse(url));
-                req.followRedirects = true;
-                req.maxRedirects = 6;
-                final res = await req.close();
-                final finalUri = res.redirects.isNotEmpty
-                    ? res.redirects.last.location.toString()
-                    : url;
-                client.close(force: true);
-                if (finalUri.startsWith('http')) return finalUri;
+                String currentUrl = url;
+                for (int i = 0; i < 6; i++) {
+                  final client = HttpClient();
+                  client.connectionTimeout = const Duration(seconds: 8);
+                  client.userAgent =
+                      'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+                  final req = await client.getUrl(Uri.parse(currentUrl));
+                  req.followRedirects = false;
+                  final res = await req.close();
+                  final loc = res.headers.value(HttpHeaders.locationHeader);
+                  client.close(force: true);
+
+                  if (loc == null || loc.isEmpty) break;
+                  final fullLoc = loc.startsWith('http')
+                      ? loc
+                      : 'https://www.instagram.com$loc';
+                  final code = _extractIgShortcodeFromText(fullLoc);
+                  if (code != null) return code;
+                  currentUrl = fullLoc;
+                }
               } catch (_) {}
-              return url;
+              return null;
             }
 
             // ==========================================================
-            // محرك استخراج تيك توك متعدد الخوادم
+            // محرك Publer المشترك (يعمل لإنستغرام وتيك توك)
+            // ==========================================================
+            Future<String?> _extractViaPubler(String cleanUrl) async {
+              try {
+                final initRes = await _dio.post(
+                  'https://app.publer.io/hooks/media',
+                  data: jsonEncode({'url': cleanUrl, 'iphone': false}),
+                  options: Options(
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Origin': 'https://publer.io',
+                      'Referer': 'https://publer.io/',
+                    },
+                  ),
+                );
+                final initMap = initRes.data is String
+                    ? jsonDecode(initRes.data)
+                    : initRes.data;
+                final jobId = initMap['job_id']?.toString();
+                if (jobId == null || jobId.isEmpty) return null;
+
+                for (int i = 0; i < 7; i++) {
+                  await Future.delayed(const Duration(milliseconds: 1200));
+                  final pollRes = await _dio.get(
+                    'https://app.publer.io/api/v1/job_status/$jobId',
+                    options: Options(headers: {
+                      'Origin': 'https://publer.io',
+                      'Referer': 'https://publer.io/',
+                    }),
+                  );
+                  final pollMap = pollRes.data is String
+                      ? jsonDecode(pollRes.data)
+                      : pollRes.data;
+                  if (pollMap['status'] == 'complete') {
+                    final payload = pollMap['payload'];
+                    if (payload is List && payload.isNotEmpty) {
+                      final path = payload[0]['path']?.toString();
+                      if (path != null && path.startsWith('http')) return path;
+                    }
+                    break;
+                  }
+                }
+              } catch (_) {}
+              return null;
+            }
+
+            // ==========================================================
+            // محركات استخراج تيك توك (6 محركات)
             // ==========================================================
             Future<Map<String, String>?> _extractTikTok(String url) async {
-              // المحرك 1: TikWM HD
+              // 1. TikWM
               try {
                 final res = await _dio.post(
                   'https://www.tikwm.com/api/',
@@ -648,7 +846,7 @@ jobs:
                 }
               } catch (_) {}
 
-              // المحرك 2: TiklyDown Fallback
+              // 2. TiklyDown
               try {
                 final res = await _dio.get(
                   'https://api.tiklydown.eu.org/api/download',
@@ -666,63 +864,89 @@ jobs:
                 }
               } catch (_) {}
 
-              // المحرك 3: Siputzx TikTok Fallback
-              try {
-                final res = await _dio.get(
-                  'https://api.siputzx.my.id/api/d/tiktok',
-                  queryParameters: {'url': url},
-                );
-                final dataMap =
-                    res.data is String ? jsonDecode(res.data) : res.data;
-                final urls = dataMap['data']?['urls'];
-                if (urls is List && urls.isNotEmpty) {
-                  return {
-                    'url': urls.first.toString(),
-                    'title': 'فيديو تيك توك بدون علامة',
-                  };
-                }
-              } catch (_) {}
+              // 3. Publer
+              final publerUrl = await _extractViaPubler(url);
+              if (publerUrl != null) {
+                return {'url': publerUrl, 'title': 'فيديو تيك توك بدون علامة'};
+              }
 
+              // 4. Siputzx / Ryzendesu / Vreden
+              final fallbacks = [
+                'https://api.siputzx.my.id/api/d/tiktok?url=${Uri.encodeComponent(url)}',
+                'https://api.ryzendesu.vip/api/downloader/ttdl?url=${Uri.encodeComponent(url)}',
+                'https://api.agatz.xyz/api/tiktok?url=${Uri.encodeComponent(url)}',
+              ];
+              for (final api in fallbacks) {
+                try {
+                  final res = await _dio.get(api);
+                  final str =
+                      res.data is String ? res.data : jsonEncode(res.data);
+                  final mp4Match =
+                      RegExp(r'https?://[^"\s<>]+?(?:\.mp4|mime_type=video_mp4)[^"\s<>]*')
+                          .firstMatch(str);
+                  if (mp4Match != null) {
+                    final found =
+                        mp4Match.group(0)!.replaceAll(r'\/', '/');
+                    return {'url': found, 'title': 'فيديو تيك توك'};
+                  }
+                } catch (_) {}
+              }
               return null;
             }
 
             // ==========================================================
-            // محرك استخراج انستغرام ريلز (5 محركات مدمجة)
+            // محركات استخراج انستغرام الشاملة (12 محركاً متتابعاً)
             // ==========================================================
             Future<Map<String, String>?> _extractInstagram(String rawUrl) async {
-              final resolvedUrl = await _resolveRedirectUrl(rawUrl);
-              final match = RegExp(r'/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)')
-                  .firstMatch(resolvedUrl);
-              final shortcode = match?.group(1);
+              final shortcode = await _resolveShareLinkShortcode(rawUrl);
+              final cleanUrl = shortcode != null
+                  ? 'https://www.instagram.com/reel/$shortcode/'
+                  : rawUrl.split('?').first;
 
-              // المحرك 1: استخراج مباشر عبر Instagram GraphQL API
               if (shortcode != null) {
-                for (final docId in ['8845758582119845', '10015901848480474']) {
+                // المحرك 1: Instagram GraphQL الرسمي مع توكن LSD
+                const lsdToken = 'AVqbxe3J_YA';
+                for (final docId in [
+                  '8845758582119845',
+                  '7153636648076553',
+                  '10015901848480474'
+                ]) {
                   try {
+                    setState(() => _statusText =
+                        "جاري الاستخراج عبر محرك إنستغرام المباشر (1/6)...");
                     final res = await _dio.post(
                       'https://www.instagram.com/graphql/query',
                       data: {
-                        'variables': jsonEncode({'shortcode': shortcode}),
+                        'av': '0',
+                        '__d': 'www',
+                        '__user': '0',
+                        '__a': '1',
+                        '__req': '3',
+                        'lsd': lsdToken,
+                        'variables': jsonEncode({
+                          'shortcode': shortcode,
+                          'fetch_tagged_user_count': null,
+                          'hoisted_comment_id': null,
+                          'hoisted_reply_id': null,
+                        }),
                         'doc_id': docId,
                       },
                       options: Options(
                         contentType: Headers.formUrlEncodedContentType,
                         headers: {
                           'X-IG-App-ID': '936619743392459',
+                          'X-FB-LSD': lsdToken,
                           'X-ASBD-ID': '129477',
-                          'X-IG-WWW-Claim': '0',
+                          'Sec-Fetch-Site': 'same-origin',
                           'Origin': 'https://www.instagram.com',
-                          'Referer':
-                              'https://www.instagram.com/reel/$shortcode/',
+                          'Referer': cleanUrl,
                         },
                       ),
                     );
-                    final map =
-                        res.data is String ? jsonDecode(res.data) : res.data;
-                    final media = map['data']?['xdt_shortcode_media'] ??
-                        map['data']?['shortcode_media'];
-                    final videoUrl = media?['video_url']?.toString();
-                    if (videoUrl != null && videoUrl.startsWith('http')) {
+                    final rawStr =
+                        res.data is String ? res.data : jsonEncode(res.data);
+                    final videoUrl = _findVideoUrlInRawJson(rawStr);
+                    if (videoUrl != null) {
                       return {
                         'url': videoUrl,
                         'title': 'فيديو ريلز انستغرام ($shortcode)',
@@ -731,81 +955,174 @@ jobs:
                   } catch (_) {}
                 }
 
-                // المحرك 2: استخراج مباشر من صفحة Embed الرسمية لإنستغرام
-                try {
-                  final res = await _dio.get(
-                    'https://www.instagram.com/p/$shortcode/embed/captioned/',
-                    options: Options(responseType: ResponseType.plain),
-                  );
-                  final html = res.data.toString();
-                  final reg = RegExp(r'"video_url"\s*:\s*"([^"]+)"');
-                  final m = reg.firstMatch(html);
-                  if (m != null && m.group(1) != null) {
-                    String cleanVideoUrl = m
-                        .group(1)!
-                        .replaceAll(r'\/', '/')
-                        .replaceAll(r'\u0026', '&')
-                        .replaceAll('&amp;', '&');
-                    if (cleanVideoUrl.startsWith('http')) {
+                // المحرك 2: فك تشفير صفحة Instagram Embed الرسمية
+                for (final embedUrl in [
+                  'https://www.instagram.com/p/$shortcode/embed/captioned/',
+                  'https://www.instagram.com/reel/$shortcode/embed/',
+                ]) {
+                  try {
+                    setState(() =>
+                        _statusText = "جاري الاستخراج عبر محرك Embed (2/6)...");
+                    final res = await _dio.get(
+                      embedUrl,
+                      options: Options(
+                        responseType: ResponseType.plain,
+                        headers: {
+                          'Referer': 'https://www.instagram.com/',
+                        },
+                      ),
+                    );
+                    final html = res.data.toString();
+                    final videoUrl = _findVideoUrlInRawJson(html);
+                    if (videoUrl != null) {
                       return {
-                        'url': cleanVideoUrl,
+                        'url': videoUrl,
                         'title': 'فيديو ريلز انستغرام ($shortcode)',
                       };
                     }
+                  } catch (_) {}
+                }
+
+                // المحرك 3: محاكاة بوتات Telegram / Discord عبر بروكسيات الميديا
+                for (final proxyUrl in [
+                  'https://d.ddinstagram.com/reel/$shortcode/',
+                  'https://www.ddinstagram.com/reel/$shortcode/',
+                  'https://kkinstagram.com/reel/$shortcode/',
+                  'https://vxinstagram.com/reel/$shortcode/',
+                ]) {
+                  try {
+                    setState(() => _statusText =
+                        "جاري الاستخراج عبر محرك البروكسي السريع (3/6)...");
+                    final res = await _dio.get(
+                      proxyUrl,
+                      options: Options(
+                        responseType: ResponseType.plain,
+                        headers: {
+                          'User-Agent': 'TelegramBot (like TwitterBot)',
+                        },
+                      ),
+                    );
+                    final html = res.data.toString();
+                    final ogMatch = RegExp(
+                            r'<meta[^>]+property="og:video(?:[:_a-z]*)"[^>]+content="([^"]+)"')
+                        .firstMatch(html);
+                    if (ogMatch != null && ogMatch.group(1) != null) {
+                      final ogUrl = ogMatch
+                          .group(1)!
+                          .replaceAll('&amp;', '&');
+                      if (ogUrl.startsWith('http')) {
+                        return {
+                          'url': ogUrl,
+                          'title': 'فيديو ريلز انستغرام ($shortcode)',
+                        };
+                      }
+                    }
+                  } catch (_) {}
+                }
+              }
+
+              // المحرك 4: محرك Publer السحابي
+              setState(
+                  () => _statusText = "جاري الاستخراج عبر محرك Publer (4/6)...");
+              final publerVideo = await _extractViaPubler(cleanUrl);
+              if (publerVideo != null) {
+                return {
+                  'url': publerVideo,
+                  'title': 'فيديو ريلز انستغرام',
+                };
+              }
+
+              // المحرك 5: سلسلة الخوادم السحابية المتعددة (7 خوادم)
+              setState(() => _statusText =
+                  "جاري الاستخراج عبر الخوادم السحابية البديلة (5/6)...");
+              final encoded = Uri.encodeComponent(cleanUrl);
+              final cloudApis = [
+                'https://api.siputzx.my.id/api/d/igdl?url=$encoded',
+                'https://api.siputzx.my.id/api/d/fastdl?url=$encoded',
+                'https://api.ryzendesu.vip/api/downloader/igdl?url=$encoded',
+                'https://api.vreden.my.id/api/igdownload?url=$encoded',
+                'https://btch.us.kg/download/igdl?url=$encoded',
+                'https://api.agatz.xyz/api/instagram?url=$encoded',
+                'https://widipe.com/download/igdl?url=$encoded',
+              ];
+
+              for (final apiUrl in cloudApis) {
+                try {
+                  final res = await _dio.get(apiUrl);
+                  final raw =
+                      res.data is String ? res.data : jsonEncode(res.data);
+                  final found = _findVideoUrlInRawJson(raw);
+                  if (found != null) {
+                    return {
+                      'url': found,
+                      'title': 'فيديو ريلز انستغرام',
+                    };
                   }
                 } catch (_) {}
               }
 
-              // المحرك 3: خادم Siputzx IGDL
-              try {
-                final res = await _dio.get(
-                  'https://api.siputzx.my.id/api/d/igdl',
-                  queryParameters: {'url': resolvedUrl},
-                );
-                final map =
-                    res.data is String ? jsonDecode(res.data) : res.data;
-                final dataList = map['data'];
-                if (dataList is List && dataList.isNotEmpty) {
-                  final vUrl = dataList.first['url']?.toString();
-                  if (vUrl != null && vUrl.startsWith('http')) {
-                    return {'url': vUrl, 'title': 'فيديو ريلز انستغرام'};
+              // المحرك 6: المحرك الجذري داخل نظام أندرويد (Native Headless WebView)
+              if (shortcode != null) {
+                try {
+                  setState(() => _statusText =
+                      "جاري الاستخراج عبر متصفح النظام الداخلي (6/6)...");
+                  final String? wvUrl = await _channel.invokeMethod<String>(
+                    'extractViaWebView',
+                    {'shortcode': shortcode},
+                  );
+                  if (wvUrl != null && wvUrl.startsWith('http')) {
+                    return {
+                      'url': wvUrl,
+                      'title': 'فيديو ريلز انستغرام ($shortcode)',
+                    };
                   }
-                }
-              } catch (_) {}
-
-              // المحرك 4: خادم Ryzendesu IGDL
-              try {
-                final res = await _dio.get(
-                  'https://api.ryzendesu.vip/api/downloader/igdl',
-                  queryParameters: {'url': resolvedUrl},
-                );
-                final map =
-                    res.data is String ? jsonDecode(res.data) : res.data;
-                final dataList = map['data'];
-                if (dataList is List && dataList.isNotEmpty) {
-                  final vUrl = dataList.first['url']?.toString();
-                  if (vUrl != null && vUrl.startsWith('http')) {
-                    return {'url': vUrl, 'title': 'فيديو ريلز انستغرام'};
-                  }
-                }
-              } catch (_) {}
-
-              // المحرك 5: خادم Vreden IGDL
-              try {
-                final res = await _dio.get(
-                  'https://api.vreden.my.id/api/igdownload',
-                  queryParameters: {'url': resolvedUrl},
-                );
-                final map =
-                    res.data is String ? jsonDecode(res.data) : res.data;
-                final vUrl =
-                    map['result']?['response']?['data']?[0]?['url']?.toString();
-                if (vUrl != null && vUrl.startsWith('http')) {
-                  return {'url': vUrl, 'title': 'فيديو ريلز انستغرام'};
-                }
-              } catch (_) {}
+                } catch (_) {}
+              }
 
               return null;
+            }
+
+            // دالة ذكية لاستخراج وتنظيف رابط الفيديو من أي نص HTML أو JSON مشفر
+            String? _findVideoUrlInRawJson(String raw) {
+              // 1. البحث عن حقل video_url حتى لو كان مشفراً بـ \"
+              final reg1 =
+                  RegExp(r'\\?"video_url\\?"\s*:\s*\\?"(https?:[^"\\]+)');
+              final m1 = reg1.firstMatch(raw);
+              if (m1 != null && m1.group(1) != null) {
+                return _unescapeUrl(m1.group(1)!);
+              }
+
+              // 2. البحث عن وسم <video src="...">
+              final reg2 = RegExp(r'<video[^>]+src="(https?://[^"]+)"');
+              final m2 = reg2.firstMatch(raw);
+              if (m2 != null && m2.group(1) != null) {
+                return _unescapeUrl(m2.group(1)!);
+              }
+
+              // 3. البحث في استجابات الخوادم السحابية عن روابط الفيديو المباشرة
+              final reg3 = RegExp(
+                r'"url"\s*:\s*"(https?:[^"]+(?:\.mp4|cdninstagram\.com|fbcdn\.net|rapidcdn|snapinsta|tikcdn)[^"]*)"',
+                caseSensitive: false,
+              );
+              for (final m in reg3.allMatches(raw)) {
+                final candidate = _unescapeUrl(m.group(1)!);
+                if (!candidate.contains('.jpg') &&
+                    !candidate.contains('.webp') &&
+                    !candidate.contains('.png')) {
+                  return candidate;
+                }
+              }
+              return null;
+            }
+
+            String _unescapeUrl(String input) {
+              return input
+                  .replaceAll(r'\\/', '/')
+                  .replaceAll(r'\/', '/')
+                  .replaceAll(r'\u0026', '&')
+                  .replaceAll(r'\\u0026', '&')
+                  .replaceAll('&amp;', '&')
+                  .trim();
             }
 
             Future<void> _startVideoDownload(String rawInput) async {
@@ -826,8 +1143,7 @@ jobs:
               setState(() {
                 _isDownloading = true;
                 _progress = 0.0;
-                _statusText =
-                    "جاري فك تشفير الرابط عبر المحركات الذكية...\n$cleanUrl";
+                _statusText = "جاري تنظيف الرابط وفك التشفير...";
               });
 
               try {
@@ -845,10 +1161,10 @@ jobs:
 
                 if (directUrl == null || directUrl.isEmpty) {
                   throw Exception(
-                      "لم تتمكن المحركات من استخراج الفيديو، تأكد من اتصال الإنترنت وأن الفيديو عام.");
+                      "الفيديو خاص أو تم حذفه من المنصة (${cleanUrl.split('?').first})");
                 }
 
-                setState(() => _statusText = "جاري تنزيل الفيديو بأعلى جودة...");
+                setState(() => _statusText = "جاري تنزيل ملف الفيديو (MP4)...");
 
                 final appDir = await getApplicationDocumentsDirectory();
                 final videosDir = Directory('${appDir.path}/downloaded_reels');
@@ -862,6 +1178,14 @@ jobs:
                 await _dio.download(
                   directUrl,
                   localFilePath,
+                  options: Options(
+                    headers: {
+                      'Referer': isTikTok
+                          ? 'https://www.tiktok.com/'
+                          : 'https://www.instagram.com/',
+                      'Accept': '*/*',
+                    },
+                  ),
                   onReceiveProgress: (rec, total) {
                     if (total != -1) {
                       setState(() => _progress = rec / total);
@@ -1124,21 +1448,22 @@ jobs:
                             ClipRRect(
                               borderRadius: BorderRadius.circular(10),
                               child: LinearProgressIndicator(
-                                value: _progress,
+                                value: _progress > 0 ? _progress : null,
                                 minHeight: 10,
                                 backgroundColor: Colors.white12,
                                 color: const Color(0xFF00F2FE),
                               ),
                             ),
                             const SizedBox(height: 10),
-                            Text(
-                              "${(_progress * 100).toStringAsFixed(0)}%",
-                              style: const TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.bold,
-                                color: Color(0xFF00F2FE),
+                            if (_progress > 0)
+                              Text(
+                                "${(_progress * 100).toStringAsFixed(0)}%",
+                                style: const TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFF00F2FE),
+                                ),
                               ),
-                            ),
                             const SizedBox(height: 6),
                           ],
                           Text(
