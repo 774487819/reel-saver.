@@ -22,13 +22,12 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-          flutter-version: '3.32.x'
 
       - name: Create Flutter Project & Install Packages
         run: |
           flutter create -a kotlin --org com.autosaver --project-name my_saver_app app_build
           cd app_build
-          flutter pub add video_player
+          flutter pub add dio shared_preferences path_provider video_player youtube_explode_dart
 
       - name: Configure Android XML & Manifest
         run: |
@@ -39,7 +38,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">محمّل الريلز الذكي</string>
-              <string name="acc_desc">يكتشف النقر المزدوج خلف الهاتف أثناء استخدام تيك توك وانستغرام، ثم ينسخ رابط الفيديو ويحمّله تلقائياً بدون علامة مائية</string>
+              <string name="acc_desc">يكتشف النقر المزدوج خلف الهاتف أثناء استخدام تيك توك وانستغرام ويوتيوب، ثم ينسخ رابط الفيديو ويحمّله تلقائياً بدون علامة مائية</string>
           </resources>
           EOF
 
@@ -157,6 +156,7 @@ jobs:
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+                      if (NativeBridge.handle(applicationContext, call, result)) return@setMethodCallHandler
                       when (call.method) {
                           "openAccessibilitySettings" -> {
                               startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -196,11 +196,6 @@ jobs:
                               val v = getSharedPreferences("auto_saver_prefs", Context.MODE_PRIVATE)
                                   .getFloat("sensitivity", 11.5f)
                               result.success(v.toDouble())
-                          }
-                          "getLibrary" -> result.success(Library.load(this).toString())
-                          "deleteVideo" -> {
-                              Library.remove(this, call.argument<String>("id") ?: "")
-                              result.success(true)
                           }
                           "downloadUrl" -> {
                               val url = call.argument<String>("url") ?: ""
@@ -244,7 +239,8 @@ jobs:
                   "com.zhiliaoapp.musically",
                   "com.zhiliaoapp.musically.go",
                   "com.ss.android.ugc.trill",
-                  "com.instagram.android"
+                  "com.instagram.android",
+                  "com.google.android.youtube"
               )
               private val shareWords = listOf("share", "مشاركة", "send", "إرسال")
               private val copyWords = listOf("copy link", "copy url", "نسخ الرابط", "نسخ رابط")
@@ -424,7 +420,7 @@ jobs:
                           val text = if (clip != null && clip.itemCount > 0) {
                               clip.getItemAt(0).coerceToText(this).toString()
                           } else ""
-                          if (text.contains("tiktok.com") || text.contains("instagram.com")) {
+                          if (text.contains("tiktok.com") || text.contains("instagram.com") || text.contains("youtube.com") || text.contains("youtu.be")) {
                               DownloadService.start(applicationContext, text)
                           } else {
                               Haptics.failure(this)
@@ -454,19 +450,15 @@ jobs:
           import android.content.Intent
           import android.content.pm.ServiceInfo
           import android.os.Build
+          import android.os.Handler
           import android.os.IBinder
-          import org.json.JSONObject
-          import java.io.File
-          import java.io.FileOutputStream
-          import java.net.HttpURLConnection
-          import java.net.URL
-          import java.net.URLEncoder
-          import java.text.SimpleDateFormat
-          import java.util.Date
-          import java.util.Locale
-          import java.util.concurrent.Executors
-          import java.util.concurrent.atomic.AtomicInteger
+          import android.os.Looper
+          import io.flutter.FlutterInjector
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.embedding.engine.dart.DartExecutor
+          import io.flutter.plugin.common.MethodChannel
 
+          // خدمة أمامية تشغّل محرك Flutter بدون واجهة (backgroundMain) لتنفيذ التحميل بنفس منطق Dart
           class DownloadService : Service() {
 
               companion object {
@@ -483,17 +475,23 @@ jobs:
                       lastUrl = url
                       lastTime = now
                       val i = Intent(ctx, DownloadService::class.java).putExtra(EXTRA_URL, url)
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                          ctx.startForegroundService(i)
-                      } else {
-                          ctx.startService(i)
-                      }
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i) else ctx.startService(i)
                   }
               }
 
-              private val executor = Executors.newSingleThreadExecutor()
-              private val pending = AtomicInteger(0)
-              private val resultCounter = AtomicInteger(0)
+              private val main = Handler(Looper.getMainLooper())
+              private var engine: FlutterEngine? = null
+              private var channel: MethodChannel? = null
+              private var ready = false
+              private var running = false
+              private var lastStartId = 0
+              private var lastText = "جاري التحضير..."
+              private val queue = ArrayDeque<String>()
+              private var resultCounter = 0
+              private val watchdog = Runnable {
+                  destroyEngine()
+                  finishJob(false, "انتهت مهلة التحميل، أعد المحاولة.")
+              }
               private val nm: NotificationManager by lazy {
                   getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
               }
@@ -501,8 +499,9 @@ jobs:
               override fun onBind(intent: Intent?): IBinder? = null
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  lastStartId = startId
                   createChannel()
-                  val first = notif("جاري التحضير...", -1, true)
+                  val first = notif(lastText, -1, true)
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                       startForeground(FG_ID, first, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
                   } else {
@@ -510,149 +509,91 @@ jobs:
                   }
 
                   val url = intent?.getStringExtra(EXTRA_URL)
-                  if (url == null) {
-                      stopForegroundCompat()
-                      stopSelf(startId)
+                  if (url.isNullOrEmpty()) {
+                      if (!running && queue.isEmpty()) shutdown()
                       return START_NOT_STICKY
                   }
-
-                  pending.incrementAndGet()
-                  executor.execute {
-                      try {
-                          process(url)
-                      } catch (e: Exception) {
-                          result("فشل التحميل: تأكد أن الحساب عام وأعد المحاولة", false)
-                          Haptics.failure(this)
-                      } finally {
-                          if (pending.decrementAndGet() <= 0) {
-                              stopForegroundCompat()
-                              stopSelf(startId)
-                          }
-                      }
-                  }
+                  queue.addLast(url)
+                  ensureEngine()
+                  pump()
                   return START_NOT_STICKY
               }
 
-              private fun process(rawUrl: String) {
-                  val clean = Regex("https?://\\S+").find(rawUrl)?.value ?: rawUrl.trim()
-                  val isTikTok = clean.contains("tiktok.com")
-                  val isInsta = clean.contains("instagram.com")
-                  if (!isTikTok && !isInsta) {
-                      result("الرابط المنسوخ ليس فيديو تيك توك أو ريلز", false)
-                      Haptics.failure(this)
-                      return
-                  }
+              private fun ensureEngine() {
+                  if (engine != null) return
+                  val loader = FlutterInjector.instance().flutterLoader()
+                  loader.startInitialization(applicationContext)
+                  loader.ensureInitializationComplete(applicationContext, null)
 
-                  update("جاري استخراج الفيديو...", -1)
-                  var direct: String? = null
-                  var title = "فيديو بدون علامة مائية"
-                  val platform = if (isTikTok) "TikTok" else "Instagram Reels"
-
-                  if (isTikTok) {
-                      val body = "url=" + URLEncoder.encode(clean, "UTF-8") + "&hd=1"
-                      val resp = post("https://www.tikwm.com/api/", body, "application/x-www-form-urlencoded", emptyMap())
-                      val j = JSONObject(resp)
-                      if (j.optInt("code", -1) == 0) {
-                          val d = j.getJSONObject("data")
-                          direct = str(d, "hdplay") ?: str(d, "play")
-                          str(d, "title")?.let { title = it }
-                          if (direct != null && direct.startsWith("/")) direct = "https://www.tikwm.com$direct"
-                      }
-                  } else {
-                      val body = JSONObject().put("url", clean).toString()
-                      val resp = post(
-                          "https://api.cobalt.tools/api/json", body, "application/json",
-                          mapOf("Accept" to "application/json")
-                      )
-                      direct = str(JSONObject(resp), "url")
-                      title = "فيديو ريلز انستغرام"
-                  }
-
-                  if (direct.isNullOrEmpty()) throw Exception("no direct url")
-
-                  val dir = File(filesDir, "downloaded_reels")
-                  if (!dir.exists()) dir.mkdirs()
-                  val id = System.currentTimeMillis().toString()
-                  val dest = File(dir, "vid_$id.mp4")
-
-                  update("جاري التنزيل... 0%", 0)
-                  download(direct, dest)
-
-                  Gallery.save(this, dest.absolutePath)
-
-                  val sizeMb = String.format(Locale.US, "%.1f MB", dest.length() / (1024.0 * 1024.0))
-                  val date = SimpleDateFormat("yyyy/MM/dd - HH:mm", Locale.US).format(Date())
-                  Library.add(
-                      this,
-                      JSONObject()
-                          .put("id", id)
-                          .put("title", title)
-                          .put("platform", platform)
-                          .put("filePath", dest.absolutePath)
-                          .put("date", date)
-                          .put("sizeMb", sizeMb)
-                  )
-
-                  Haptics.vibrate(this, 300)
-                  result("تم حفظ الفيديو في المعرض ✓", true)
-              }
-
-              private fun str(o: JSONObject, key: String): String? {
-                  if (!o.has(key) || o.isNull(key)) return null
-                  val s = o.optString(key).trim()
-                  return if (s.isEmpty() || s == "null") null else s
-              }
-
-              private fun open(u: String): HttpURLConnection {
-                  val c = URL(u).openConnection() as HttpURLConnection
-                  c.connectTimeout = 15000
-                  c.readTimeout = 30000
-                  c.setRequestProperty(
-                      "User-Agent",
-                      "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
-                  )
-                  return c
-              }
-
-              private fun post(u: String, body: String, type: String, headers: Map<String, String>): String {
-                  val c = open(u)
-                  c.requestMethod = "POST"
-                  c.doOutput = true
-                  c.setRequestProperty("Content-Type", type)
-                  headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
-                  c.outputStream.use { it.write(body.toByteArray()) }
-                  val code = c.responseCode
-                  val stream = if (code >= 400) c.errorStream else c.inputStream
-                  val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-                  if (code >= 400) throw Exception("HTTP $code")
-                  return text
-              }
-
-              private fun download(urlStr: String, dest: File) {
-                  val c = open(urlStr)
-                  c.requestMethod = "GET"
-                  if (c.responseCode >= 400) throw Exception("HTTP ${c.responseCode}")
-                  val total = c.contentLengthLong
-                  var read = 0L
-                  var lastPct = -5
-                  c.inputStream.use { input ->
-                      FileOutputStream(dest).use { out ->
-                          val buf = ByteArray(32 * 1024)
-                          while (true) {
-                              val n = input.read(buf)
-                              if (n < 0) break
-                              out.write(buf, 0, n)
-                              read += n
-                              if (total > 0) {
-                                  val pct = (read * 100 / total).toInt()
-                                  if (pct >= lastPct + 5) {
-                                      lastPct = pct
-                                      update("جاري التنزيل... $pct%", pct)
-                                  }
-                              }
+                  val e = FlutterEngine(applicationContext)
+                  val ch = MethodChannel(e.dartExecutor.binaryMessenger, "auto_saver/channel")
+                  ch.setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "bgReady" -> {
+                              ready = true
+                              result.success(true)
+                              pump()
                           }
+                          "bgProgress" -> {
+                              val text = call.argument<String>("text")
+                              val pct = call.argument<Int>("progress") ?: -1
+                              if (text != null) lastText = text
+                              nm.notify(FG_ID, notif(lastText, pct, true))
+                              result.success(true)
+                          }
+                          "bgDone" -> {
+                              val ok = call.argument<Boolean>("ok") ?: false
+                              val msg = call.argument<String>("message") ?: ""
+                              result.success(true)
+                              finishJob(ok, msg)
+                          }
+                          else -> if (!NativeBridge.handle(applicationContext, call, result)) result.notImplemented()
                       }
                   }
+                  engine = e
+                  channel = ch
+                  ready = false
+                  e.dartExecutor.executeDartEntrypoint(
+                      DartExecutor.DartEntrypoint(loader.findAppBundlePath(), "backgroundMain")
+                  )
+              }
+
+              private fun pump() {
+                  if (running || queue.isEmpty() || !ready) return
+                  running = true
+                  val url = queue.removeFirst()
+                  lastText = "جاري التحضير..."
+                  nm.notify(FG_ID, notif(lastText, -1, true))
+                  main.postDelayed(watchdog, 4 * 60 * 1000L)
+                  channel?.invokeMethod("startJob", url)
+              }
+
+              private fun finishJob(ok: Boolean, msg: String) {
+                  if (!running) return
+                  running = false
+                  main.removeCallbacks(watchdog)
+                  nm.notify(FG_ID + 1 + (++resultCounter), notif(msg, -1, false, ok))
+                  if (!ok) Haptics.failure(this)
+                  if (queue.isEmpty()) shutdown() else {
+                      ensureEngine()
+                      pump()
+                  }
+              }
+
+              private fun destroyEngine() {
+                  try {
+                      channel?.setMethodCallHandler(null)
+                      engine?.destroy()
+                  } catch (_: Exception) {}
+                  engine = null
+                  channel = null
+                  ready = false
+              }
+
+              private fun shutdown() {
+                  destroyEngine()
+                  stopForegroundCompat()
+                  stopSelf(lastStartId)
               }
 
               private fun createChannel() {
@@ -672,9 +613,9 @@ jobs:
                   }
                   b.setContentTitle("محمّل الريلز الذكي")
                       .setContentText(text)
+                      .setStyle(Notification.BigTextStyle().bigText(text))
                       .setSmallIcon(
-                          if (done) android.R.drawable.stat_sys_download_done
-                          else android.R.drawable.stat_sys_download
+                          if (done) android.R.drawable.stat_sys_download_done else android.R.drawable.stat_sys_download
                       )
                       .setOngoing(ongoing)
                       .setOnlyAlertOnce(true)
@@ -688,27 +629,199 @@ jobs:
                   return b.build()
               }
 
-              private fun update(text: String, progress: Int) {
-                  nm.notify(FG_ID, notif(text, progress, true))
-              }
-
-              private fun result(text: String, ok: Boolean) {
-                  nm.notify(FG_ID + 1 + resultCounter.incrementAndGet(), notif(text, -1, false, ok))
-              }
-
               @Suppress("DEPRECATION")
               private fun stopForegroundCompat() {
                   stopForeground(true)
               }
 
               override fun onDestroy() {
-                  executor.shutdown()
+                  main.removeCallbacks(watchdog)
+                  destroyEngine()
                   super.onDestroy()
               }
           }
           EOF
 
-          cat << 'EOF' > app_build/android/app/src/main/kotlin/com/autosaver/my_saver_app/Library.kt
+          cat << 'EOF' > app_build/android/app/src/main/kotlin/com/autosaver/my_saver_app/NativeBridge.kt
+          package com.autosaver.my_saver_app
+
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.media.MediaMetadataRetriever
+          import android.os.Handler
+          import android.os.Looper
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import io.flutter.plugin.common.MethodCall
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+
+          // الدوال الأصلية المشتركة بين واجهة التطبيق ومحرك الخلفية (Headless Flutter)
+          object NativeBridge {
+              private val main = Handler(Looper.getMainLooper())
+              private var headlessWebView: WebView? = null
+
+              fun handle(ctx: Context, call: MethodCall, result: MethodChannel.Result): Boolean {
+                  when (call.method) {
+                      "validateVideoFile" -> result.success(isPlayableVideoFile(call.argument<String>("path") ?: ""))
+                      "saveToGallery" -> {
+                          val path = call.argument<String>("path") ?: ""
+                          Thread {
+                              val ok = Gallery.save(ctx, path)
+                              main.post { result.success(ok) }
+                          }.start()
+                      }
+                      "vibrate" -> {
+                          Haptics.vibrate(ctx, (call.argument<Int>("ms") ?: 200).toLong())
+                          result.success(true)
+                      }
+                      "extractViaWebView" -> extractInstagramViaWebView(ctx, call.argument<String>("shortcode") ?: "", result)
+                      else -> return false
+                  }
+                  return true
+              }
+
+              private fun isPlayableVideoFile(filePath: String): Boolean {
+                  var retriever: MediaMetadataRetriever? = null
+                  return try {
+                      val file = File(filePath)
+                      if (!file.exists() || file.length() < 150 * 1024) return false
+                      retriever = MediaMetadataRetriever()
+                      retriever.setDataSource(filePath)
+                      val hasVideo = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_VIDEO)
+                      val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                      val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                      (hasVideo == "yes" && width > 0 && duration > 400L)
+                  } catch (e: Exception) {
+                      false
+                  } finally {
+                      try { retriever?.release() } catch (_: Exception) {}
+                  }
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun extractInstagramViaWebView(ctx: Context, shortcode: String, result: MethodChannel.Result) {
+                  if (shortcode.isEmpty()) {
+                      result.success(null)
+                      return
+                  }
+                  var isCompleted = false
+
+                  fun finishWith(url: String?) {
+                      if (!isCompleted) {
+                          isCompleted = true
+                          main.post {
+                              try {
+                                  headlessWebView?.stopLoading()
+                                  headlessWebView?.destroy()
+                                  headlessWebView = null
+                              } catch (_: Exception) {}
+                              result.success(url)
+                          }
+                      }
+                  }
+
+                  main.post {
+                      try {
+                          headlessWebView?.destroy()
+                          val wv = WebView(ctx.applicationContext)
+                          headlessWebView = wv
+                          wv.settings.javaScriptEnabled = true
+                          wv.settings.domStorageEnabled = true
+                          wv.settings.mediaPlaybackRequiresUserGesture = false
+                          wv.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                          wv.settings.userAgentString =
+                              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+                          wv.addJavascriptInterface(object {
+                              @JavascriptInterface
+                              fun onVideoUrlFound(url: String?) {
+                                  if (!url.isNullOrEmpty() && url.startsWith("http") && !url.contains("bytestart=")) {
+                                      finishWith(url)
+                                  }
+                              }
+                          }, "AndroidExtractor")
+
+                          wv.webViewClient = object : WebViewClient() {
+                              override fun onPageFinished(view: WebView?, url: String?) {
+                                  super.onPageFinished(view, url)
+                                  val js = """
+                                      (async function() {
+                                          try {
+                                              function cleanStr(s) {
+                                                  return s.replace(/\\\\\//g, '/')
+                                                          .replace(/\\\//g, '/')
+                                                          .replace(/\\u0026/g, '&')
+                                                          .replace(/\\\\u0026/g, '&')
+                                                          .replace(/\\"/g, '"')
+                                                          .replace(/&amp;/g, '&');
+                                              }
+
+                                              var rawHtml = cleanStr(document.documentElement.innerHTML);
+                                              var m1 = rawHtml.match(/"video_url"\s*:\s*"(https?:\/\/[^"]+)"/);
+                                              if (m1 && m1[1] && m1[1].indexOf('bytestart=') === -1) {
+                                                  AndroidExtractor.onVideoUrlFound(m1[1]);
+                                                  return;
+                                              }
+
+                                              var lsdMatch = document.documentElement.innerHTML.match(/"LSD"\s*,\s*\[\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/);
+                                              var lsd = lsdMatch ? lsdMatch[1] : 'AVqbxe3J_YA';
+                                              var docIds = ['8845758582119845', '10015901848480474', '7153636648076553'];
+
+                                              for (var i = 0; i < docIds.length; i++) {
+                                                  try {
+                                                      var body = 'av=0&__d=www&__user=0&__a=1&lsd=' + encodeURIComponent(lsd) +
+                                                          '&variables=' + encodeURIComponent(JSON.stringify({shortcode: '$shortcode'})) +
+                                                          '&doc_id=' + docIds[i];
+                                                      var resp = await fetch('https://www.instagram.com/graphql/query', {
+                                                          method: 'POST',
+                                                          headers: {
+                                                              'Content-Type': 'application/x-www-form-urlencoded',
+                                                              'X-IG-App-ID': '936619743392459',
+                                                              'X-FB-LSD': lsd,
+                                                              'X-ASBD-ID': '129477'
+                                                          },
+                                                          body: body
+                                                      });
+                                                      var txt = cleanStr(await resp.text());
+                                                      var mGql = txt.match(/"video_url"\s*:\s*"(https?:\/\/[^"]+)"/);
+                                                      if (mGql && mGql[1]) {
+                                                          AndroidExtractor.onVideoUrlFound(mGql[1]);
+                                                          return;
+                                                      }
+                                                  } catch (e) {}
+                                              }
+
+                                              var btn = document.querySelector('.EmbedVideo, .WatchOnInstagram, button, div[role="button"]');
+                                              if (btn) btn.click();
+                                              for (var t = 0; t < 10; t++) {
+                                                  await new Promise(r => setTimeout(r, 400));
+                                                  var v = document.querySelector('video');
+                                                  if (v && v.src && v.src.indexOf('http') === 0 && v.src.indexOf('bytestart=') === -1) {
+                                                      AndroidExtractor.onVideoUrlFound(v.src);
+                                                      return;
+                                                  }
+                                              }
+                                          } catch (err) {}
+                                      })();
+                                  """.trimIndent()
+                                  view?.evaluateJavascript(js, null)
+                              }
+                          }
+
+                          wv.loadUrl("https://www.instagram.com/p/$shortcode/embed/captioned/")
+                          main.postDelayed({ finishWith(null) }, 10000)
+                      } catch (e: Exception) {
+                          finishWith(null)
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app_build/android/app/src/main/kotlin/com/autosaver/my_saver_app/Helpers.kt
           package com.autosaver.my_saver_app
 
           import android.content.ContentValues
@@ -719,56 +832,9 @@ jobs:
           import android.os.VibrationEffect
           import android.os.Vibrator
           import android.provider.MediaStore
-          import org.json.JSONArray
-          import org.json.JSONObject
           import java.io.File
           import java.io.FileInputStream
           import java.io.FileOutputStream
-
-          object Library {
-              private const val FILE = "library.json"
-
-              @Synchronized
-              fun load(ctx: Context): JSONArray {
-                  val f = File(ctx.filesDir, FILE)
-                  if (!f.exists()) return JSONArray()
-                  return try {
-                      val old = JSONArray(f.readText())
-                      val arr = JSONArray()
-                      for (i in 0 until old.length()) {
-                          val o = old.getJSONObject(i)
-                          if (File(o.optString("filePath")).exists()) arr.put(o)
-                      }
-                      arr
-                  } catch (e: Exception) {
-                      JSONArray()
-                  }
-              }
-
-              @Synchronized
-              fun add(ctx: Context, item: JSONObject) {
-                  val old = load(ctx)
-                  val arr = JSONArray()
-                  arr.put(item)
-                  for (i in 0 until old.length()) arr.put(old.get(i))
-                  File(ctx.filesDir, FILE).writeText(arr.toString())
-              }
-
-              @Synchronized
-              fun remove(ctx: Context, id: String) {
-                  val old = load(ctx)
-                  val arr = JSONArray()
-                  for (i in 0 until old.length()) {
-                      val o = old.getJSONObject(i)
-                      if (o.optString("id") == id) {
-                          try { File(o.optString("filePath")).delete() } catch (_: Exception) {}
-                      } else {
-                          arr.put(o)
-                      }
-                  }
-                  File(ctx.filesDir, FILE).writeText(arr.toString())
-              }
-          }
 
           object Gallery {
               fun save(ctx: Context, filePath: String): Boolean {
@@ -837,48 +903,19 @@ jobs:
           }
           EOF
 
-      - name: Write Flutter UI (lib/main.dart)
+      - name: Write Flutter Code (downloader + UI)
         run: |
-          cat << 'EOF' > app_build/lib/main.dart
+          cat << 'EOF' > app_build/lib/core.dart
           import 'dart:async';
           import 'dart:convert';
           import 'dart:io';
-          import 'package:flutter/material.dart';
+          import 'package:dio/dio.dart';
           import 'package:flutter/services.dart';
-          import 'package:video_player/video_player.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
-          // ==========================================================
-          // ضع اسمك الشخصي هنا ليظهر أسفل الصفحة الرئيسية
-          // ==========================================================
-          const String kDeveloperName = "تطوير: [اكتب اسمك هنا]";
-          const String kAppTitle = "محمّل الريلز الذكي";
-
-          // ألوان التصميم
-          const Color kBg = Color(0xFF070B14);
-          const Color kSurface = Color(0xFF111827);
-          const Color kCard = Color(0xFF151D30);
-          const Color kCyan = Color(0xFF22D3EE);
-          const Color kViolet = Color(0xFF8B5CF6);
-          const Color kPink = Color(0xFFEC4899);
-          const Color kGreen = Color(0xFF34D399);
-          const Color kAmber = Color(0xFFFBBF24);
-
-          const LinearGradient kBrandGradient = LinearGradient(
-            colors: [kCyan, kViolet],
-            begin: Alignment.topRight,
-            end: Alignment.bottomLeft,
-          );
-
-          void main() {
-            WidgetsFlutterBinding.ensureInitialized();
-            SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-              statusBarColor: Colors.transparent,
-              statusBarIconBrightness: Brightness.light,
-              systemNavigationBarColor: kSurface,
-              systemNavigationBarIconBrightness: Brightness.light,
-            ));
-            runApp(const AutoReelSaverApp());
-          }
+          const MethodChannel kChannel = MethodChannel('auto_saver/channel');
 
           class DownloadedVideoItem {
             final String id;
@@ -915,6 +952,668 @@ jobs:
                   date: json['date'] ?? '',
                   sizeMb: json['sizeMb'] ?? '0 MB',
                 );
+          }
+
+          // مكتبة الفيديوهات: مشتركة بين واجهة التطبيق ومحرك الخلفية عبر SharedPreferences
+          class LibraryStore {
+            static const String _key = 'saved_videos_list';
+
+            static Future<List<DownloadedVideoItem>> load() async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.reload();
+              final saved = prefs.getStringList(_key) ?? [];
+              final List<DownloadedVideoItem> out = [];
+              for (final s in saved) {
+                try {
+                  final item = DownloadedVideoItem.fromJson(jsonDecode(s));
+                  if (File(item.filePath).existsSync()) out.add(item);
+                } catch (_) {}
+              }
+              return out;
+            }
+
+            static Future<void> _save(List<DownloadedVideoItem> list) async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setStringList(
+                  _key, list.map((v) => jsonEncode(v.toJson())).toList());
+            }
+
+            static Future<void> add(DownloadedVideoItem item) async {
+              final list = await load();
+              list.insert(0, item);
+              await _save(list);
+            }
+
+            static Future<void> remove(DownloadedVideoItem item) async {
+              try {
+                final f = File(item.filePath);
+                if (await f.exists()) await f.delete();
+              } catch (_) {}
+              final list = await load();
+              list.removeWhere((v) => v.id == item.id);
+              await _save(list);
+            }
+          }
+
+          class DownloadResult {
+            final bool ok;
+            final String message;
+            DownloadResult(this.ok, this.message);
+          }
+
+          class ReelDownloader {
+            final String customApi;
+            final void Function(String) onStatus;
+            final void Function(double) onProgress;
+            late final Dio _dio;
+            String? _ytTitle;
+
+            ReelDownloader({
+              required this.customApi,
+              required this.onStatus,
+              required this.onProgress,
+            }) {
+              _dio = Dio(BaseOptions(
+                connectTimeout: const Duration(seconds: 15),
+                receiveTimeout: const Duration(seconds: 35),
+                validateStatus: (status) => status != null && status < 500,
+                headers: {
+                  'User-Agent':
+                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                  'Accept': '*/*',
+                  'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+                },
+              ));
+            }
+
+            static bool isSupported(String url) =>
+                url.contains('tiktok.com') ||
+                url.contains('instagram.com') ||
+                url.contains('youtube.com') ||
+                url.contains('youtu.be');
+
+            // ============================ الدخول الرئيسي ============================
+            Future<DownloadResult> download(String rawInput) async {
+              final urlMatch = RegExp(r'https?://[^\s"<>]+').firstMatch(rawInput);
+              final cleanUrl = urlMatch?.group(0) ?? rawInput.trim();
+
+              if (!isSupported(cleanUrl)) {
+                return DownloadResult(false,
+                    "الرابط غير مدعوم، انسخ رابط TikTok أو Instagram أو YouTube.");
+              }
+
+              final bool isTikTok = cleanUrl.contains('tiktok.com');
+              final bool isInsta = cleanUrl.contains('instagram.com');
+              final String platform =
+                  isTikTok ? 'TikTok' : (isInsta ? 'Instagram Reels' : 'YouTube');
+
+              onProgress(0);
+              onStatus("جاري استخراج وتنزيل الفيديو الكامل...");
+
+              try {
+                final appDir = await getApplicationDocumentsDirectory();
+                final videosDir = Directory('${appDir.path}/downloaded_reels');
+                if (!await videosDir.exists()) {
+                  await videosDir.create(recursive: true);
+                }
+
+                final id = DateTime.now().millisecondsSinceEpoch.toString();
+                final localFilePath = '${videosDir.path}/vid_$id.mp4';
+
+                final bool success = isTikTok
+                    ? await _downloadTikTokVerified(cleanUrl, localFilePath)
+                    : (isInsta
+                        ? await _downloadInstagramVerified(cleanUrl, localFilePath)
+                        : await _downloadYouTubeVerified(cleanUrl, localFilePath));
+
+                if (!success) {
+                  throw Exception(
+                      "تعذر الحصول على ملف فيديو صالح من جميع المحركات. أضف رابط خادمك الخاص (yt-dlp) من التطبيق لضمان العمل دائماً.");
+                }
+
+                try {
+                  await kChannel.invokeMethod('saveToGallery', {'path': localFilePath});
+                } catch (_) {}
+
+                final fileBytes = await File(localFilePath).length();
+                final sizeMb = "${(fileBytes / (1024 * 1024)).toStringAsFixed(1)} MB";
+                final now = DateTime.now();
+                final dateStr =
+                    "${now.year}/${now.month.toString().padLeft(2, '0')}/${now.day.toString().padLeft(2, '0')} - ${now.hour}:${now.minute.toString().padLeft(2, '0')}";
+
+                final shortcode = _extractIgShortcodeFromText(cleanUrl) ?? id;
+                final title = isTikTok
+                    ? "فيديو تيك توك بدون علامة"
+                    : (isInsta ? "فيديو ريلز ($shortcode)" : (_ytTitle ?? "فيديو يوتيوب"));
+
+                await LibraryStore.add(DownloadedVideoItem(
+                  id: id,
+                  title: title,
+                  platform: platform,
+                  filePath: localFilePath,
+                  date: dateStr,
+                  sizeMb: sizeMb,
+                ));
+
+                try {
+                  await kChannel.invokeMethod('vibrate', {'ms': 300});
+                } catch (_) {}
+                return DownloadResult(
+                    true, "تم تنزيل الفيديو الكامل ($sizeMb) وحفظه في المعرض ✓");
+              } catch (e) {
+                return DownloadResult(
+                    false, "تعذر التحميل: ${e.toString().replaceAll('Exception: ', '')}");
+              }
+            }
+
+            // ============================ أدوات مشتركة ============================
+            String? _extractIgShortcodeFromText(String input) {
+              final decoded = Uri.decodeFull(input);
+              final reg = RegExp(
+                r'instagram\.com/(?!share/)(?:[A-Za-z0-9_.-]+/)?(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)',
+                caseSensitive: false,
+              );
+              final match = reg.firstMatch(decoded);
+              if (match != null && match.group(1) != null) return match.group(1);
+              final fallback =
+                  RegExp(r'/(?:reel|reels|p|tv)/([A-Za-z0-9_-]{6,})').firstMatch(decoded);
+              if (fallback != null && !decoded.contains('/share/')) {
+                return fallback.group(1);
+              }
+              return null;
+            }
+
+            Future<String?> _resolveShareLinkShortcode(String url) async {
+              final directCode = _extractIgShortcodeFromText(url);
+              if (directCode != null) return directCode;
+
+              try {
+                String currentUrl = url;
+                for (int i = 0; i < 6; i++) {
+                  final client = HttpClient();
+                  client.connectionTimeout = const Duration(seconds: 8);
+                  client.userAgent =
+                      'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+                  final req = await client.getUrl(Uri.parse(currentUrl));
+                  req.followRedirects = false;
+                  final res = await req.close();
+                  final loc = res.headers.value(HttpHeaders.locationHeader);
+                  client.close(force: true);
+
+                  if (loc == null || loc.isEmpty) break;
+                  final fullLoc =
+                      loc.startsWith('http') ? loc : 'https://www.instagram.com$loc';
+                  final code = _extractIgShortcodeFromText(fullLoc);
+                  if (code != null) return code;
+                  if (fullLoc.contains('/accounts/login')) break;
+                  currentUrl = fullLoc;
+                }
+              } catch (_) {}
+              return null;
+            }
+
+            List<String> _extractAllValidVideoUrls(String raw) {
+              final List<String> results = [];
+              final norm = raw
+                  .replaceAll(r'\\/', '/')
+                  .replaceAll(r'\/', '/')
+                  .replaceAll(r'\\u0026', '&')
+                  .replaceAll(r'\u0026', '&')
+                  .replaceAll(r'\"', '"')
+                  .replaceAll('&amp;', '&');
+
+              void addCandidate(String? u) {
+                if (u == null) return;
+                final clean = u.trim();
+                if (!clean.startsWith('http')) return;
+                if (clean.contains('static.cdninstagram.com')) return;
+                if (clean.contains('bytestart=')) return;
+                if (clean.contains('.jpg') ||
+                    clean.contains('.jpeg') ||
+                    clean.contains('.png') ||
+                    clean.contains('.webp') ||
+                    clean.contains('.js') ||
+                    clean.contains('.css')) return;
+                if (!results.contains(clean)) results.add(clean);
+              }
+
+              for (final m
+                  in RegExp(r'"video_url"\s*:\s*"(https?://[^"]+)"').allMatches(norm)) {
+                addCandidate(m.group(1));
+              }
+              for (final m in RegExp(
+                      r'"video_versions"\s*:\s*\[\s*\{[^}]*"url"\s*:\s*"(https?://[^"]+)"')
+                  .allMatches(norm)) {
+                addCandidate(m.group(1));
+              }
+              for (final m
+                  in RegExp(r'<video[^>]+src="(https?://[^"]+)"').allMatches(norm)) {
+                addCandidate(m.group(1));
+              }
+              for (final m in RegExp(
+                r'"(?:url|hdplay|play|noWatermark|video)"\s*:\s*"(https?://[^"]+)"',
+                caseSensitive: false,
+              ).allMatches(norm)) {
+                final c = m.group(1)!;
+                if (!c.contains('instagram.com/reel/') && !c.contains('instagram.com/p/')) {
+                  addCandidate(c);
+                }
+              }
+              return results;
+            }
+
+            Future<String?> _extractViaPubler(String cleanUrl) async {
+              try {
+                final initRes = await _dio.post(
+                  'https://app.publer.io/hooks/media',
+                  data: jsonEncode({'url': cleanUrl, 'iphone': false}),
+                  options: Options(
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Origin': 'https://publer.io',
+                      'Referer': 'https://publer.io/',
+                    },
+                  ),
+                );
+                final initMap =
+                    initRes.data is String ? jsonDecode(initRes.data) : initRes.data;
+                final jobId = initMap['job_id']?.toString();
+                if (jobId == null || jobId.isEmpty) return null;
+
+                for (int i = 0; i < 7; i++) {
+                  await Future.delayed(const Duration(milliseconds: 1200));
+                  final pollRes = await _dio.get(
+                    'https://app.publer.io/api/v1/job_status/$jobId',
+                    options: Options(headers: {
+                      'Origin': 'https://publer.io',
+                      'Referer': 'https://publer.io/',
+                    }),
+                  );
+                  final pollMap =
+                      pollRes.data is String ? jsonDecode(pollRes.data) : pollRes.data;
+                  if (pollMap['status'] == 'complete') {
+                    final payload = pollMap['payload'];
+                    if (payload is List && payload.isNotEmpty) {
+                      final path = payload[0]['path']?.toString();
+                      if (path != null && path.startsWith('http')) return path;
+                    }
+                    break;
+                  }
+                }
+              } catch (_) {}
+              return null;
+            }
+
+            // خادم yt-dlp الخاص: الطريقة الأكثر ثباتاً على المدى الطويل
+            Future<String?> _tryCustomServer(String targetUrl) async {
+              final base = customApi.trim();
+              if (base.isEmpty) return null;
+              try {
+                final sep = base.contains('?') ? '&' : '?';
+                final res = await _dio.get(
+                  '$base${sep}url=${Uri.encodeComponent(targetUrl)}',
+                );
+                if (res.data is String) {
+                  final t = (res.data as String).trim();
+                  if (t.startsWith('http')) return t;
+                }
+                dynamic data = res.data;
+                try {
+                  data = res.data is String ? jsonDecode(res.data) : res.data;
+                } catch (_) {}
+                String? candidate;
+                void dig(dynamic d) {
+                  if (candidate != null || d == null) return;
+                  if (d is Map) {
+                    for (final k in [
+                      'url', 'video', 'video_url', 'hdplay', 'play', 'download', 'link'
+                    ]) {
+                      final v = d[k];
+                      if (v is String &&
+                          v.startsWith('http') &&
+                          !v.contains('.jpg') &&
+                          !v.contains('.png')) {
+                        candidate = v;
+                        return;
+                      }
+                    }
+                    d.forEach((_, v) => dig(v));
+                  } else if (d is List) {
+                    for (final v in d) {
+                      dig(v);
+                    }
+                  }
+                }
+
+                dig(data);
+                return candidate;
+              } catch (_) {}
+              return null;
+            }
+
+            Future<bool> _validate(String path) async {
+              try {
+                return await kChannel
+                        .invokeMethod<bool>('validateVideoFile', {'path': path}) ??
+                    false;
+              } catch (_) {
+                return false;
+              }
+            }
+
+            Future<bool> _tryDownloadAndVerifyVideo(
+              String candidateUrl,
+              String savePath,
+              bool isTikTok,
+              String engineName,
+            ) async {
+              try {
+                final f = File(savePath);
+                if (await f.exists()) await f.delete();
+
+                onStatus("جاري التحميل عبر محرك: $engineName");
+
+                await _dio.download(
+                  candidateUrl,
+                  savePath,
+                  options: Options(
+                    headers: {
+                      'Referer': engineName.contains('tikwm')
+                          ? 'https://www.tikwm.com/'
+                          : (isTikTok
+                              ? 'https://www.tiktok.com/'
+                              : 'https://www.instagram.com/'),
+                      'Accept': '*/*',
+                    },
+                  ),
+                  onReceiveProgress: (rec, total) {
+                    if (total > 150000) onProgress(rec / total);
+                  },
+                );
+
+                if (!await _validate(savePath)) {
+                  if (await f.exists()) await f.delete();
+                  onStatus("فشل محرك $engineName (ملف غير صالح)، جارٍ تجربة المحرك التالي...");
+                  return false;
+                }
+                return true;
+              } catch (e) {
+                final f = File(savePath);
+                if (await f.exists()) await f.delete();
+                onStatus(
+                    "فشل محرك $engineName (${e.toString().split('\n').first})، جارٍ تجربة المحرك التالي...");
+                return false;
+              }
+            }
+
+            // ============================ تيك توك ============================
+            Future<bool> _downloadTikTokVerified(String url, String savePath) async {
+              final custom = await _tryCustomServer(url);
+              if (custom != null &&
+                  await _tryDownloadAndVerifyVideo(custom, savePath, true, 'الخادم الخاص')) {
+                return true;
+              }
+
+              try {
+                final res = await _dio.post(
+                  'https://www.tikwm.com/api/',
+                  data: {'url': url, 'hd': 1},
+                  options: Options(contentType: Headers.formUrlEncodedContentType),
+                );
+                final dataMap = res.data is String ? jsonDecode(res.data) : res.data;
+                if (dataMap is Map && dataMap['code'] == 0) {
+                  final d = dataMap['data'];
+                  for (final key in ['hdplay', 'play', 'wmplay']) {
+                    String? u = d[key]?.toString();
+                    if (u != null && u.isNotEmpty) {
+                      if (u.startsWith('/')) u = 'https://www.tikwm.com$u';
+                      if (await _tryDownloadAndVerifyVideo(u, savePath, true, 'tikwm')) {
+                        return true;
+                      }
+                    }
+                  }
+                }
+              } catch (_) {}
+
+              final publerUrl = await _extractViaPubler(url);
+              if (publerUrl != null &&
+                  await _tryDownloadAndVerifyVideo(publerUrl, savePath, true, 'publer')) {
+                return true;
+              }
+
+              final encoded = Uri.encodeComponent(url);
+              final cloudApis = [
+                'https://api.tiklydown.eu.org/api/download?url=$encoded',
+                'https://api.siputzx.my.id/api/d/ttdl?url=$encoded',
+                'https://api.siputzx.my.id/api/d/fastdl?url=$encoded',
+              ];
+              for (final apiUrl in cloudApis) {
+                try {
+                  final res = await _dio.get(
+                    apiUrl,
+                    options: Options(responseType: ResponseType.bytes),
+                  );
+                  final raw = utf8.decode(res.data, allowMalformed: true);
+                  for (final u in _extractAllValidVideoUrls(raw)) {
+                    if (await _tryDownloadAndVerifyVideo(u, savePath, true, 'api سحابي')) {
+                      return true;
+                    }
+                  }
+                } catch (_) {}
+              }
+              return false;
+            }
+
+            // ============================ انستغرام ============================
+            Future<bool> _downloadInstagramVerified(String rawUrl, String savePath) async {
+              final shortcode = await _resolveShareLinkShortcode(rawUrl);
+              final cleanUrl = shortcode != null
+                  ? 'https://www.instagram.com/reel/$shortcode/'
+                  : rawUrl.split('?').first;
+
+              final custom = await _tryCustomServer(cleanUrl);
+              if (custom != null &&
+                  await _tryDownloadAndVerifyVideo(custom, savePath, false, 'الخادم الخاص')) {
+                return true;
+              }
+
+              if (shortcode != null) {
+                onStatus("جاري استخراج الفيديو الأصلي الكامل (HD MP4)...");
+                try {
+                  final String? wvUrl = await kChannel.invokeMethod<String>(
+                    'extractViaWebView',
+                    {'shortcode': shortcode},
+                  );
+                  if (wvUrl != null &&
+                      await _tryDownloadAndVerifyVideo(wvUrl, savePath, false, 'محرك WebView')) {
+                    return true;
+                  }
+                } catch (_) {}
+
+                const lsdToken = 'AVqbxe3J_YA';
+                for (final docId in ['8845758582119845', '10015901848480474', '7153636648076553']) {
+                  try {
+                    final res = await _dio.post(
+                      'https://www.instagram.com/graphql/query',
+                      data: {
+                        'av': '0',
+                        '__d': 'www',
+                        '__user': '0',
+                        '__a': '1',
+                        'lsd': lsdToken,
+                        'variables': jsonEncode({'shortcode': shortcode}),
+                        'doc_id': docId,
+                      },
+                      options: Options(
+                        contentType: Headers.formUrlEncodedContentType,
+                        headers: {
+                          'X-IG-App-ID': '936619743392459',
+                          'X-FB-LSD': lsdToken,
+                          'X-ASBD-ID': '129477',
+                          'Origin': 'https://www.instagram.com',
+                          'Referer': cleanUrl,
+                        },
+                      ),
+                    );
+                    final raw = res.data is String ? res.data : jsonEncode(res.data);
+                    for (final u in _extractAllValidVideoUrls(raw)) {
+                      if (await _tryDownloadAndVerifyVideo(u, savePath, false, 'GraphQL')) {
+                        return true;
+                      }
+                    }
+                  } catch (_) {}
+                }
+
+                try {
+                  final res = await _dio.get(
+                    'https://www.instagram.com/p/$shortcode/embed/captioned/',
+                    options: Options(responseType: ResponseType.bytes),
+                  );
+                  final raw = utf8.decode(res.data, allowMalformed: true);
+                  for (final u in _extractAllValidVideoUrls(raw)) {
+                    if (await _tryDownloadAndVerifyVideo(u, savePath, false, 'Embed')) {
+                      return true;
+                    }
+                  }
+                } catch (_) {}
+              }
+
+              onStatus("جاري التحميل عبر الخادم السحابي...");
+              final publerVideo = await _extractViaPubler(cleanUrl);
+              if (publerVideo != null &&
+                  await _tryDownloadAndVerifyVideo(publerVideo, savePath, false, 'publer')) {
+                return true;
+              }
+
+              final encoded = Uri.encodeComponent(cleanUrl);
+              final cloudApis = [
+                'https://api.siputzx.my.id/api/d/igdl?url=$encoded',
+                'https://api.siputzx.my.id/api/d/fastdl?url=$encoded',
+                'https://api.ryzendesu.vip/api/downloader/igdl?url=$encoded',
+                'https://api.vreden.my.id/api/igdownload?url=$encoded',
+                'https://btch.us.kg/download/igdl?url=$encoded',
+              ];
+              for (final apiUrl in cloudApis) {
+                try {
+                  final res = await _dio.get(
+                    apiUrl,
+                    options: Options(responseType: ResponseType.bytes),
+                  );
+                  final raw = utf8.decode(res.data, allowMalformed: true);
+                  for (final u in _extractAllValidVideoUrls(raw)) {
+                    if (await _tryDownloadAndVerifyVideo(u, savePath, false, 'api سحابي')) {
+                      return true;
+                    }
+                  }
+                } catch (_) {}
+              }
+              return false;
+            }
+
+            // ============================ يوتيوب ============================
+            // الطريقة 1: خادمك الخاص (yt-dlp)  |  الطريقة 2: استخراج مباشر على الهاتف بمكتبة youtube_explode
+            Future<bool> _downloadYouTubeVerified(String url, String savePath) async {
+              final custom = await _tryCustomServer(url);
+              if (custom != null &&
+                  await _tryDownloadAndVerifyVideo(custom, savePath, false, 'الخادم الخاص')) {
+                return true;
+              }
+
+              final yt = YoutubeExplode();
+              final f = File(savePath);
+              try {
+                onStatus("جاري قراءة معلومات فيديو يوتيوب...");
+                final video = await yt.videos.get(url);
+                _ytTitle = video.title;
+
+                final manifest = await yt.videos.streamsClient.getManifest(video.id);
+                if (manifest.muxed.isEmpty) {
+                  onStatus("لا يوجد ملف فيديو بصوت مدمج لهذا المقطع.");
+                  return false;
+                }
+                final info = manifest.muxed.withHighestBitrate();
+                onStatus("جاري التحميل من يوتيوب...");
+
+                if (await f.exists()) await f.delete();
+                final sink = f.openWrite();
+                final total = info.size.totalBytes;
+                var got = 0;
+                var lastPct = -1;
+                try {
+                  await for (final chunk in yt.videos.streamsClient.get(info)) {
+                    got += chunk.length;
+                    sink.add(chunk);
+                    if (total > 0) {
+                      final pct = (got * 100 ~/ total);
+                      if (pct != lastPct) {
+                        lastPct = pct;
+                        onProgress(got / total);
+                      }
+                    }
+                  }
+                  await sink.flush();
+                } finally {
+                  await sink.close();
+                }
+
+                if (!await _validate(savePath)) {
+                  if (await f.exists()) await f.delete();
+                  onStatus("ملف يوتيوب غير صالح.");
+                  return false;
+                }
+                return true;
+              } catch (e) {
+                if (await f.exists()) await f.delete();
+                onStatus("فشل محرك يوتيوب المحلي (${e.toString().split('\n').first})");
+                return false;
+              } finally {
+                yt.close();
+              }
+            }
+          }
+          EOF
+
+          cat << 'EOF' > app_build/lib/main.dart
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:video_player/video_player.dart';
+          import 'core.dart';
+
+          // ==========================================================
+          // ضع اسمك الشخصي هنا ليظهر أسفل الصفحة الرئيسية
+          // ==========================================================
+          const String kDeveloperName = "تطوير: [اكتب اسمك هنا]";
+          const String kAppTitle = "محمّل الريلز الذكي";
+
+          // ألوان التصميم
+          const Color kBg = Color(0xFF070B14);
+          const Color kSurface = Color(0xFF111827);
+          const Color kCard = Color(0xFF151D30);
+          const Color kCyan = Color(0xFF22D3EE);
+          const Color kViolet = Color(0xFF8B5CF6);
+          const Color kPink = Color(0xFFEC4899);
+          const Color kGreen = Color(0xFF34D399);
+          const Color kAmber = Color(0xFFFBBF24);
+
+          const LinearGradient kBrandGradient = LinearGradient(
+            colors: [kCyan, kViolet],
+            begin: Alignment.topRight,
+            end: Alignment.bottomLeft,
+          );
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+              statusBarColor: Colors.transparent,
+              statusBarIconBrightness: Brightness.light,
+              systemNavigationBarColor: kSurface,
+              systemNavigationBarIconBrightness: Brightness.light,
+            ));
+            runApp(const AutoReelSaverApp());
           }
 
           class AutoReelSaverApp extends StatelessWidget {
@@ -961,8 +1660,10 @@ jobs:
 
           class _MainDashboardState extends State<MainDashboard>
               with WidgetsBindingObserver, SingleTickerProviderStateMixin {
-            static const MethodChannel _channel = MethodChannel('auto_saver/channel');
+            static const MethodChannel _channel = kChannel;
             final TextEditingController _manualUrlController = TextEditingController();
+            final TextEditingController _customApiController = TextEditingController();
+            Timer? _libTimer;
             late final AnimationController _pulse;
 
             int _selectedTabIndex = 0;
@@ -970,7 +1671,7 @@ jobs:
             bool _isOverlayEnabled = false;
             bool _isNotifEnabled = false;
             double _sensitivity = 11.5;
-            String _statusText = "جاهز — افتح تيك توك أو انستغرام وانقر مرتين خلف الهاتف";
+            String _statusText = "جاهز — افتح تيك توك أو انستغرام أو يوتيوب وانقر مرتين خلف الهاتف";
             List<DownloadedVideoItem> _downloadedVideos = [];
 
             @override
@@ -982,13 +1683,16 @@ jobs:
                 duration: const Duration(seconds: 3),
               )..repeat();
               _loadInitialData();
+              _libTimer = Timer.periodic(const Duration(seconds: 3), (_) => _reloadLibrary());
             }
 
             @override
             void dispose() {
               WidgetsBinding.instance.removeObserver(this);
               _pulse.dispose();
+              _libTimer?.cancel();
               _manualUrlController.dispose();
+              _customApiController.dispose();
               super.dispose();
             }
 
@@ -1005,6 +1709,10 @@ jobs:
             Future<void> _loadInitialData() async {
               await _checkPermissions();
               try {
+                final prefs = await SharedPreferences.getInstance();
+                _customApiController.text = prefs.getString('custom_api_url') ?? '';
+              } catch (_) {}
+              try {
                 final s = await _channel.invokeMethod<double>('getSensitivity');
                 if (s != null && mounted) setState(() => _sensitivity = s);
               } catch (_) {}
@@ -1013,10 +1721,7 @@ jobs:
 
             Future<void> _reloadLibrary() async {
               try {
-                final raw = await _channel.invokeMethod<String>('getLibrary');
-                final list = (jsonDecode(raw ?? '[]') as List)
-                    .map((e) => DownloadedVideoItem.fromJson(Map<String, dynamic>.from(e)))
-                    .toList();
+                final list = await LibraryStore.load();
                 if (mounted) setState(() => _downloadedVideos = list);
               } catch (_) {}
             }
@@ -1038,8 +1743,8 @@ jobs:
             Future<void> _submitManual() async {
               final raw = _manualUrlController.text.trim();
               final url = RegExp(r'https?://\S+').firstMatch(raw)?.group(0) ?? raw;
-              if (!url.contains('tiktok.com') && !url.contains('instagram.com')) {
-                setState(() => _statusText = "الرابط ليس فيديو تيك توك أو ريلز صالح!");
+              if (!ReelDownloader.isSupported(url)) {
+                setState(() => _statusText = "الرابط ليس فيديو تيك توك أو انستغرام أو يوتيوب صالح!");
                 return;
               }
               try {
@@ -1054,10 +1759,10 @@ jobs:
             }
 
             Future<void> _deleteVideo(DownloadedVideoItem item) async {
-              try {
-                await _channel.invokeMethod('deleteVideo', {'id': item.id});
-              } catch (_) {}
-              setState(() => _downloadedVideos.removeWhere((v) => v.id == item.id));
+              await LibraryStore.remove(item);
+              if (mounted) {
+                setState(() => _downloadedVideos.removeWhere((v) => v.id == item.id));
+              }
             }
 
             // ==========================================================
@@ -1192,6 +1897,7 @@ jobs:
                   _buildSensitivityCard(),
                   const SizedBox(height: 16),
                   _buildManualCard(),
+                  _buildServerCard(),
                   const SizedBox(height: 22),
                   Center(
                     child: Text(
@@ -1425,6 +2131,55 @@ jobs:
               );
             }
 
+            Widget _buildServerCard() {
+              return _card(
+                border: kCyan.withOpacity(0.3),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(Icons.dns_rounded, color: kCyan),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            "خادم الاستخراج الخاص (اختياري)",
+                            style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      "الـ APIs المجانية تتوقف كثيراً. لضمان العمل دائماً الصق رابط خادم yt-dlp الخاص بك. يُجرَّب أولاً قبل أي محرك آخر.",
+                      style: TextStyle(fontSize: 12, color: Colors.white54, height: 1.6),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: _customApiController,
+                      style: const TextStyle(fontSize: 13),
+                      onChanged: (v) async {
+                        final prefs = await SharedPreferences.getInstance();
+                        await prefs.setString('custom_api_url', v.trim());
+                      },
+                      decoration: InputDecoration(
+                        hintText: "https://your-server.onrender.com/extract",
+                        hintStyle: const TextStyle(color: Colors.white30, fontSize: 13),
+                        filled: true,
+                        fillColor: kBg,
+                        contentPadding:
+                            const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(16),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+
             Widget _buildSensitivityCard() {
               return _card(
                 child: Column(
@@ -1500,7 +2255,7 @@ jobs:
                       controller: _manualUrlController,
                       style: const TextStyle(fontSize: 13),
                       decoration: InputDecoration(
-                        hintText: "الصق رابط تيك توك أو انستغرام هنا",
+                        hintText: "الصق رابط تيك توك أو انستغرام أو يوتيوب هنا",
                         hintStyle: const TextStyle(color: Colors.white30, fontSize: 13),
                         filled: true,
                         fillColor: kBg,
@@ -1821,6 +2576,50 @@ jobs:
                 ),
               );
             }
+          }
+
+
+          // ==========================================================
+          // نقطة دخول محرك الخلفية (بدون واجهة) — تُشغَّل من DownloadService
+          // ==========================================================
+          @pragma('vm:entry-point')
+          Future<void> backgroundMain() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            bool busy = false;
+
+            kChannel.setMethodCallHandler((call) async {
+              if (call.method == 'startJob') {
+                final url = call.arguments as String? ?? '';
+                if (busy) return;
+                busy = true;
+                try {
+                  final prefs = await SharedPreferences.getInstance();
+                  await prefs.reload();
+                  int lastPct = -1;
+                  final dl = ReelDownloader(
+                    customApi: prefs.getString('custom_api_url') ?? '',
+                    onStatus: (s) {
+                      kChannel.invokeMethod('bgProgress', {'text': s});
+                    },
+                    onProgress: (p) {
+                      final pct = (p * 100).toInt();
+                      if (pct != lastPct) {
+                        lastPct = pct;
+                        kChannel.invokeMethod('bgProgress', {'progress': pct});
+                      }
+                    },
+                  );
+                  final r = await dl.download(url);
+                  await kChannel.invokeMethod('bgDone', {'ok': r.ok, 'message': r.message});
+                } catch (e) {
+                  await kChannel.invokeMethod('bgDone', {'ok': false, 'message': 'تعذر التحميل: $e'});
+                } finally {
+                  busy = false;
+                }
+              }
+            });
+
+            await kChannel.invokeMethod('bgReady');
           }
           EOF
 
