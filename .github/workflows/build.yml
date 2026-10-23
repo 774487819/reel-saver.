@@ -459,6 +459,20 @@ jobs:
               private var lastActionTime: Long = 0
               private val handler = Handler(Looper.getMainLooper())
 
+              // ===== تقييد العمل داخل انستجرام وتيك توك فقط =====
+              private var currentPackage: String = ""
+              private val allowedPackages = setOf(
+                  "com.instagram.android",
+                  "com.instagram.lite",
+                  "com.zhiliaoapp.musically",   // TikTok عالمي
+                  "com.ss.android.ugc.trill"    // TikTok نسخة آسيا
+              )
+              private val ignoredPackages = setOf(
+                  "com.android.systemui",
+                  "com.google.android.inputmethod.latin",
+                  "com.samsung.android.honeyboard"
+              )
+
               override fun onServiceConnected() {
                   super.onServiceConnected()
                   sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -468,6 +482,7 @@ jobs:
 
               override fun onSensorChanged(event: SensorEvent?) {
                   if (event == null) return
+                  if (currentPackage !in allowedPackages) return
                   val prefs = getSharedPreferences("auto_saver_prefs", Context.MODE_PRIVATE)
                   val sensitivity = prefs.getFloat("sensitivity", 11.5f)
 
@@ -493,9 +508,11 @@ jobs:
               }
 
               private fun executeAutoShareAndCopy() {
+                  val root = rootInActiveWindow ?: return
+                  val pkg = root.packageName?.toString() ?: ""
+                  if (pkg !in allowedPackages) return
                   vibrateShort(120)
 
-                  val root = rootInActiveWindow ?: return
                   val shareWords = listOf("مشاركة", "إرسال", "Share", "Send", "share")
                   val clickedShare = findAndClickNode(root, shareWords)
 
@@ -576,7 +593,16 @@ jobs:
               }
 
               override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null) return
+                  if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                      val pkg = event.packageName?.toString() ?: return
+                      if (pkg in ignoredPackages) return
+                      currentPackage = pkg
+                  }
+              }
+
               override fun onInterrupt() {}
           }
           EOF
