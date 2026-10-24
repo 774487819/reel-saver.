@@ -454,35 +454,61 @@ jobs:
           }
 
           class AutoReelGrabberService : AccessibilityService(), SensorEventListener {
+              // الخدمة تعمل فقط أثناء وجودك داخل هذه التطبيقات
+              private val targetPackages = setOf(
+                  "com.instagram.android",
+                  "com.instagram.lite",
+                  "com.zhiliaoapp.musically",
+                  "com.zhiliaoapp.musically.go",
+                  "com.ss.android.ugc.trill"
+              )
+
               private var sensorManager: SensorManager? = null
+              private var listening = false
+              private var busy = false
               private var firstTapTime: Long = 0
               private var lastActionTime: Long = 0
               private val handler = Handler(Looper.getMainLooper())
 
-              // ===== تقييد العمل داخل انستجرام وتيك توك فقط =====
-              private var currentPackage: String = ""
-              private val allowedPackages = setOf(
-                  "com.instagram.android",
-                  "com.instagram.lite",
-                  "com.zhiliaoapp.musically",   // TikTok عالمي
-                  "com.ss.android.ugc.trill"    // TikTok نسخة آسيا
-              )
-              private val ignoredPackages = setOf(
-                  "com.android.systemui",
-                  "com.google.android.inputmethod.latin",
-                  "com.samsung.android.honeyboard"
-              )
-
               override fun onServiceConnected() {
                   super.onServiceConnected()
                   sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-                  val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+                  if (isTargetForeground()) startListening()
+              }
+
+              private fun isTargetForeground(): Boolean {
+                  val pkg = rootInActiveWindow?.packageName?.toString() ?: return false
+                  return pkg in targetPackages
+              }
+
+              private fun startListening() {
+                  if (listening) return
+                  val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION) ?: return
                   sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+                  listening = true
+              }
+
+              private fun stopListening() {
+                  if (!listening) return
+                  sensorManager?.unregisterListener(this)
+                  listening = false
+                  firstTapTime = 0
+              }
+
+              // تشغيل المستشعر عند دخول انستغرام/تيك توك وإيقافه عند الخروج منهما (يوفر البطارية)
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val pkg = event.packageName?.toString() ?: return
+                  when {
+                      pkg in targetPackages -> startListening()
+                      pkg == packageName || pkg == "android" ||
+                          pkg.contains("systemui") || pkg.contains("inputmethod") || pkg.contains("keyboard") -> Unit
+                      else -> stopListening()
+                  }
               }
 
               override fun onSensorChanged(event: SensorEvent?) {
-                  if (event == null) return
-                  if (currentPackage !in allowedPackages) return
+                  if (event == null || busy) return
                   val prefs = getSharedPreferences("auto_saver_prefs", Context.MODE_PRIVATE)
                   val sensitivity = prefs.getFloat("sensitivity", 11.5f)
 
@@ -500,6 +526,8 @@ jobs:
                           val diff = now - firstTapTime
                           if (diff in 120..500) {
                               firstTapTime = 0
+                              // حماية إضافية: لا ننفّذ شيئاً إلا إذا كانت الواجهة الحالية انستغرام أو تيك توك
+                              if (!isTargetForeground()) return
                               lastActionTime = now
                               executeAutoShareAndCopy()
                           }
@@ -509,8 +537,7 @@ jobs:
 
               private fun executeAutoShareAndCopy() {
                   val root = rootInActiveWindow ?: return
-                  val pkg = root.packageName?.toString() ?: ""
-                  if (pkg !in allowedPackages) return
+                  busy = true
                   vibrateShort(120)
 
                   val shareWords = listOf("مشاركة", "إرسال", "Share", "Send", "share")
@@ -520,21 +547,34 @@ jobs:
                       tapCoordinates(0.91f, 0.72f)
                   }
 
+                  waitAndClickCopy(0)
+              }
+
+              // قائمة المشاركة قد تتأخر: نحاول عدة مرات، ولا نفتح التطبيق إلا إذا نجح نسخ الرابط فعلاً
+              // (هذا يمنع تحميل نفس الفيديو مرتين بسبب رابط قديم عالق في الحافظة)
+              private fun waitAndClickCopy(attempt: Int) {
+                  val delayMs = if (attempt == 0) 900L else 400L
                   handler.postDelayed({
                       val currentRoot = rootInActiveWindow
                       val copyWords = listOf("نسخ الرابط", "نسخ", "Copy link", "Copy URL", "copy")
-                      if (currentRoot != null) {
-                          findAndClickNode(currentRoot, copyWords)
-                      }
+                      val clicked = currentRoot != null && findAndClickNode(currentRoot, copyWords)
 
-                      handler.postDelayed({
-                          val launchIntent = Intent(this, MainActivity::class.java).apply {
-                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                              putExtra("auto_copied", true)
+                      when {
+                          clicked -> handler.postDelayed({
+                              val launchIntent = Intent(this, MainActivity::class.java).apply {
+                                  addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                                  putExtra("auto_copied", true)
+                              }
+                              startActivity(launchIntent)
+                              busy = false
+                          }, 450)
+                          attempt < 5 -> waitAndClickCopy(attempt + 1)
+                          else -> {
+                              vibrateFail()
+                              busy = false
                           }
-                          startActivity(launchIntent)
-                      }, 550)
-                  }, 950)
+                      }
+                  }, delayMs)
               }
 
               private fun findAndClickNode(node: AccessibilityNodeInfo, keywords: List<String>): Boolean {
@@ -592,17 +632,29 @@ jobs:
                   }
               }
 
-              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-                  if (event == null) return
-                  if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                      val pkg = event.packageName?.toString() ?: return
-                      if (pkg in ignoredPackages) return
-                      currentPackage = pkg
+              // اهتزازتان قصيرتان = فشل (لم يُعثر على زر المشاركة أو نسخ الرابط)
+              private fun vibrateFail() {
+                  val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                  val pattern = longArrayOf(0, 80, 90, 80)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+                  } else {
+                      @Suppress("DEPRECATION")
+                      vibrator.vibrate(pattern, -1)
                   }
               }
 
+              override fun onUnbind(intent: Intent?): Boolean {
+                  stopListening()
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  stopListening()
+                  super.onDestroy()
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
               override fun onInterrupt() {}
           }
           EOF
@@ -797,6 +849,8 @@ jobs:
             String _statusText =
                 "تصفح تيك توك أو ريلز وانقر مرتين خلف الهاتف للنسخ والتحميل التلقائي";
             List<DownloadedVideoItem> _downloadedVideos = [];
+            final List<String> _queue = [];
+            final Map<String, DateTime> _recentKeys = {};
 
             @override
             void initState() {
@@ -819,6 +873,19 @@ jobs:
                 if (call.method == "onAutoLinkCaptured") {
                   final String copiedUrl = call.arguments as String? ?? "";
                   if (copiedUrl.isNotEmpty) {
+                    // منع تحميل نفس الفيديو مرتين (رابط قديم عالق في الحافظة)
+                    final key = _linkKey(copiedUrl);
+                    final last = _recentKeys[key];
+                    if (last != null &&
+                        DateTime.now().difference(last).inMinutes < 10) {
+                      setState(() => _statusText =
+                          "هذا نفس الفيديو الذي حُمّل قبل قليل (لم يُنسخ رابط جديد). انقر مرتين على الفيديو التالي.");
+                      try {
+                        await _channel.invokeMethod('vibrate', {'ms': 150});
+                      } catch (_) {}
+                      return;
+                    }
+                    _recentKeys[key] = DateTime.now();
                     _manualUrlController.text = copiedUrl;
                     await _startVideoDownload(copiedUrl);
                   }
@@ -1323,8 +1390,23 @@ jobs:
               return false;
             }
 
+            // مفتاح موحّد للفيديو لاكتشاف التكرار (بدون عوامل التتبع في الرابط)
+            String _linkKey(String raw) {
+              final m = RegExp(r'https?://[^\s"<>]+').firstMatch(raw);
+              final url = m?.group(0) ?? raw.trim();
+              final ig = _extractIgShortcodeFromText(url);
+              if (ig != null) return 'ig:$ig';
+              return url.split('?').first.split('#').first;
+            }
+
             Future<void> _startVideoDownload(String rawInput) async {
-              if (_isDownloading) return;
+              // تحميل أول، ثم الثاني: أي رابط يصل أثناء التحميل يدخل قائمة الانتظار
+              if (_isDownloading) {
+                _queue.add(rawInput);
+                setState(() => _statusText =
+                    "أُضيف إلى قائمة الانتظار (${_queue.length}) — سيُحمَّل بعد انتهاء الحالي");
+                return;
+              }
 
               final urlMatch = RegExp(r'https?://[^\s"<>]+').firstMatch(rawInput);
               final cleanUrl = urlMatch?.group(0) ?? rawInput.trim();
@@ -1399,12 +1481,17 @@ jobs:
                 await _saveVideoListToStorage();
                 await _channel.invokeMethod('vibrate', {'ms': 300});
               } catch (e) {
+                _recentKeys.remove(_linkKey(cleanUrl));
                 setState(() {
                   _statusText =
                       "تعذر التحميل: ${e.toString().replaceAll('Exception: ', '')}";
                 });
               } finally {
                 setState(() => _isDownloading = false);
+                if (_queue.isNotEmpty) {
+                  final next = _queue.removeAt(0);
+                  Future.microtask(() => _startVideoDownload(next));
+                }
               }
             }
 
@@ -1459,28 +1546,6 @@ jobs:
                       ),
                     ),
                   ),
-                  bottomNavigationBar: NavigationBar(
-                    backgroundColor: kSurface,
-                    indicatorColor: kCyan.withOpacity(0.18),
-                    selectedIndex: _selectedTabIndex,
-                    onDestinationSelected: (i) => setState(() => _selectedTabIndex = i),
-                    destinations: [
-                      const NavigationDestination(
-                        icon: Icon(Icons.radar_outlined),
-                        selectedIcon: Icon(Icons.radar, color: kCyan),
-                        label: 'الرئيسية',
-                      ),
-                      NavigationDestination(
-                        icon: Badge(
-                          isLabelVisible: _downloadedVideos.isNotEmpty,
-                          label: Text('${_downloadedVideos.length}'),
-                          child: const Icon(Icons.video_library_outlined),
-                        ),
-                        selectedIcon: const Icon(Icons.video_library, color: kCyan),
-                        label: 'مكتبتي',
-                      ),
-                    ],
-                  ),
                 ),
               );
             }
@@ -1509,6 +1574,23 @@ jobs:
                         style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
                       ),
                     ),
+                    IconButton(
+                      tooltip: _selectedTabIndex == 0 ? 'مكتبتي' : 'الرئيسية',
+                      onPressed: () => setState(
+                          () => _selectedTabIndex = _selectedTabIndex == 0 ? 1 : 0),
+                      icon: Badge(
+                        isLabelVisible:
+                            _selectedTabIndex == 0 && _downloadedVideos.isNotEmpty,
+                        label: Text('${_downloadedVideos.length}'),
+                        child: Icon(
+                          _selectedTabIndex == 0
+                              ? Icons.video_library_rounded
+                              : Icons.home_rounded,
+                          color: kCyan,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                       decoration: BoxDecoration(
